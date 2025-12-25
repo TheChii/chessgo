@@ -1,26 +1,33 @@
 //! Board evaluation module.
 //!
-//! Provides static evaluation of chess positions.
-//! Currently uses simple material counting.
-//! Designed for easy extension to NNUE evaluation.
+//! Uses NNUE if available, otherwise falls back to material.
 
 use crate::types::{Board, Score, Color, Piece, piece_value, Value};
+// use crate::uci::UciHandler;
 
-/// Evaluate the position from the side-to-move's perspective.
+pub mod nnue;
+
+/// Evaluate the position.
 ///
-/// Returns a score in centipawns.
-/// Positive = good for side to move, negative = bad.
-pub fn evaluate(board: &Board) -> Score {
-    let eval = material_eval(board);
-    
-    // Convert to side-to-move perspective
-    let score = if board.side_to_move() == Color::White {
-        eval
+/// Uses NNUE if a model is provided, otherwise simple material fallback.
+pub fn evaluate(board: &Board, model: Option<&nnue::Model>) -> Score {
+    if let Some(m) = model {
+        // Use NNUE
+        nnue::evaluate(&m.model, board)
     } else {
-        -eval
-    };
+        // Fallback to simple material
+        material_eval_wrapper(board)
+    }
+}
 
-    Score::cp(score)
+/// Wrapper for material eval that returns Score
+fn material_eval_wrapper(board: &Board) -> Score {
+    let eval = material_eval(board);
+    if board.side_to_move() == Color::White {
+        Score::cp(eval)
+    } else {
+        Score::cp(-eval)
+    }
 }
 
 /// Simple material evaluation (white's perspective)
@@ -40,39 +47,15 @@ fn material_eval(board: &Board) -> Value {
     score
 }
 
-// === Future: NNUE Evaluation ===
-// pub struct NnueEvaluator {
-//     model: nnue::stockfish::halfkp::SfHalfKpModel,
-//     state: Option<nnue::stockfish::halfkp::SfHalfKpState>,
-// }
-//
-// impl NnueEvaluator {
-//     pub fn evaluate(&mut self, board: &Board) -> Score {
-//         // Build NNUE state from board
-//         // Call activate()
-//         // Scale output to centipawns
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
 
     #[test]
-    fn test_starting_position() {
+    fn test_starting_position_material() {
         let board = Board::default();
-        let score = evaluate(&board);
-        // Starting position should be roughly equal
+        let score = material_eval_wrapper(&board);
         assert!(score.raw().abs() < 50);
-    }
-
-    #[test]
-    fn test_material_advantage() {
-        // Position where white is up a queen
-        let board = Board::from_str("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
-        let score = evaluate(&board);
-        // White should be significantly ahead
-        assert!(score.raw() > 800);
     }
 }

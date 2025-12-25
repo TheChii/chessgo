@@ -148,7 +148,8 @@ fn quiescence(
     searcher.update_seldepth(ply);
 
     // Stand-pat: evaluate the position
-    let stand_pat = eval::evaluate(board);
+    // Use NNUE if available (via searcher.nnue)
+    let stand_pat = eval::evaluate(board, searcher.nnue.as_ref());
 
     // Beta cutoff
     if stand_pat >= beta {

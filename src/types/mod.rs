@@ -16,7 +16,7 @@ mod convert;
 // Re-export our custom types
 pub use score::{Score, SCORE_INFINITY, SCORE_MATE, SCORE_DRAW, SCORE_NONE};
 pub use depth::{Depth, Ply, MAX_DEPTH, MAX_PLY};
-pub use convert::ToNnue;
+pub use convert::{ToNnue, nnue_color_flip};
 
 // Re-export chess crate types as canonical types
 // This gives us a single source of truth and avoids confusion

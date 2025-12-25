@@ -25,6 +25,7 @@ pub use limits::{SearchLimits, TimeManager};
 pub use negamax::SearchResult;
 
 use crate::types::{Board, Move, Score, Depth, Ply, NodeCount};
+use crate::eval::nnue;
 use std::time::Instant;
 
 /// Search statistics collected during search
@@ -62,6 +63,8 @@ pub struct Searcher {
     stop: bool,
     /// Start time of search
     start_time: Option<Instant>,
+    /// NNUE Model (thread-safe reference)
+    nnue: Option<nnue::Model>,
     // === Future extensibility ===
     // pub tt: TranspositionTable,
     // pub history: HistoryTable,
@@ -78,7 +81,13 @@ impl Searcher {
             pv: Vec::new(),
             stop: false,
             start_time: None,
+            nnue: None,
         }
+    }
+
+    /// Set NNUE model
+    pub fn set_nnue(&mut self, model: Option<nnue::Model>) {
+        self.nnue = model;
     }
 
     /// Set the position to search

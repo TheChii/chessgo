@@ -4,6 +4,7 @@ use super::parser::{parse_command, UciCommand};
 use super::{parse_move, format_move, SearchParams, ENGINE_NAME, ENGINE_AUTHOR};
 use crate::types::{Board, Move, Score};
 use crate::search::{Searcher, SearchLimits};
+use crate::eval::nnue;
 use std::io::{self, BufRead, Write};
 use std::str::FromStr;
 
@@ -27,9 +28,23 @@ impl Default for UciHandler {
 
 impl UciHandler {
     pub fn new() -> Self {
+        let mut searcher = Searcher::new();
+        
+        // Attempt to load NNUE model
+        let nnue_path = "network.nnue";
+        match nnue::load_model(nnue_path) {
+            Ok(model) => {
+                eprintln!("info string NNUE model loaded: {}", model.desc);
+                searcher.set_nnue(Some(model));
+            },
+            Err(_) => {
+                eprintln!("info string Warning: network.nnue not found. Using material fallback.");
+            }
+        }
+
         Self {
             board: Board::default(),
-            searcher: Searcher::new(),
+            searcher,
             debug: false,
             quit: false,
         }
