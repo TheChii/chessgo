@@ -153,6 +153,26 @@ pub fn search(
         }
     }
 
+    // === Internal Iterative Deepening (IID) ===
+    // If we are at a PV node and have no TT move, search shallower to find one
+    if tt_move.is_none() && depth.raw() >= 6 && (beta.raw() - alpha.raw() > 1) {
+        let iid_depth = Depth::new(depth.raw() - 2);
+        
+        let result = search(
+            searcher,
+            evaluator,
+            board,
+            iid_depth,
+            ply,
+            alpha,
+            beta,
+            allow_null,
+            prev_move,
+        );
+        
+        tt_move = result.best_move;
+    }
+
     // Generate legal moves
     let mut moves: Vec<Move> = MoveGen::new_legal(board).collect();
 
