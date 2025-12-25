@@ -1,13 +1,7 @@
 //! Move ordering heuristics.
 //!
 //! Good move ordering is critical for alpha-beta pruning efficiency.
-//! This module provides ordering functions with:
-//! - Transposition table moves (best first)
-//! - Good captures via SEE (MVV-LVA, skip losing)
-//! - Killer moves (quiet moves that caused cutoffs)
-//! - Counter-moves (moves that refute opponent's last move)
-//! - History heuristic (success rate of quiet moves)
-//! - Promotion bonuses
+//! Uses lazy selection sort to avoid full sort overhead.
 
 use crate::types::{Board, Move, piece_value};
 use super::history::HistoryTable;
@@ -24,6 +18,7 @@ const COUNTER_MOVE_BONUS: i32 = 30_000;
 const BAD_CAPTURE_PENALTY: i32 = -10_000;
 
 /// MVV-LVA scores for capture ordering
+#[inline]
 fn mvv_lva_score(board: &Board, m: Move) -> i32 {
     let victim = board.piece_on(m.get_dest());
     let attacker = board.piece_on(m.get_source());
@@ -37,7 +32,8 @@ fn mvv_lva_score(board: &Board, m: Move) -> i32 {
 }
 
 /// Score a move for ordering (higher = search first)
-fn score_move(
+#[inline]
+pub fn score_move(
     board: &Board, 
     m: Move, 
     tt_move: Option<Move>,
@@ -85,7 +81,130 @@ fn score_move(
     score
 }
 
-/// Order moves for main search with all heuristics
+/// Move picker struct for lazy move ordering
+/// Uses selection sort - only finds next best move when needed
+pub struct MovePicker {
+    moves: [Move; 256],
+    scores: [i32; 256],
+    count: usize,
+    current: usize,
+}
+
+impl MovePicker {
+    /// Create a new move picker with scored moves
+    pub fn new(
+        board: &Board,
+        moves_in: &[Move],
+        tt_move: Option<Move>,
+        killers: [Option<Move>; 2],
+        counter_move: Option<Move>,
+        history: &HistoryTable,
+        color: Color,
+    ) -> Self {
+        let mut picker = MovePicker {
+            moves: [Move::default(); 256],
+            scores: [0; 256],
+            count: moves_in.len(),
+            current: 0,
+        };
+        
+        for (i, &m) in moves_in.iter().enumerate() {
+            picker.moves[i] = m;
+            picker.scores[i] = score_move(board, m, tt_move, killers, counter_move, history, color);
+        }
+        
+        picker
+    }
+
+    /// Get next best move using selection sort (find max, swap to front)
+    #[inline]
+    pub fn next(&mut self) -> Option<Move> {
+        if self.current >= self.count {
+            return None;
+        }
+
+        // Find best remaining move
+        let mut best_idx = self.current;
+        let mut best_score = self.scores[self.current];
+        
+        for i in (self.current + 1)..self.count {
+            if self.scores[i] > best_score {
+                best_score = self.scores[i];
+                best_idx = i;
+            }
+        }
+
+        // Swap best to current position
+        self.moves.swap(self.current, best_idx);
+        self.scores.swap(self.current, best_idx);
+        
+        let mv = self.moves[self.current];
+        self.current += 1;
+        Some(mv)
+    }
+
+    /// Get current move index (for LMR)
+    #[inline]
+    pub fn move_index(&self) -> usize {
+        self.current.saturating_sub(1)
+    }
+}
+
+/// Simple capture ordering for quiescence (no allocations)
+pub struct CapturePicker {
+    moves: [Move; 256],
+    scores: [i32; 256],
+    count: usize,
+    current: usize,
+}
+
+impl CapturePicker {
+    /// Create picker for captures only (MVV-LVA + SEE)
+    pub fn new(board: &Board, moves_in: &[Move]) -> Self {
+        let mut picker = CapturePicker {
+            moves: [Move::default(); 256],
+            scores: [0; 256],
+            count: moves_in.len(),
+            current: 0,
+        };
+        
+        for (i, &m) in moves_in.iter().enumerate() {
+            picker.moves[i] = m;
+            // Use MVV-LVA as primary, SEE for tie-breaking
+            picker.scores[i] = mvv_lva_score(board, m) * 100 + see::see(board, m).min(100);
+        }
+        
+        picker
+    }
+
+    /// Get next best capture
+    #[inline]
+    pub fn next(&mut self) -> Option<Move> {
+        if self.current >= self.count {
+            return None;
+        }
+
+        let mut best_idx = self.current;
+        let mut best_score = self.scores[self.current];
+        
+        for i in (self.current + 1)..self.count {
+            if self.scores[i] > best_score {
+                best_score = self.scores[i];
+                best_idx = i;
+            }
+        }
+
+        self.moves.swap(self.current, best_idx);
+        self.scores.swap(self.current, best_idx);
+        
+        let mv = self.moves[self.current];
+        self.current += 1;
+        Some(mv)
+    }
+}
+
+// Keep old functions for compatibility during migration
+#[allow(dead_code)]
 pub fn order_moves_full(
     board: &Board, 
     moves: &mut [Move], 
@@ -95,18 +214,33 @@ pub fn order_moves_full(
     history: &HistoryTable,
     color: Color,
 ) {
-    let mut scored: Vec<(Move, i32)> = moves.iter()
-        .map(|&m| (m, score_move(board, m, tt_move, killers, counter_move, history, color)))
-        .collect();
-
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-
-    for (i, (m, _)) in scored.into_iter().enumerate() {
-        moves[i] = m;
+    // Score moves in place
+    let mut scores: [i32; 256] = [0; 256];
+    let count = moves.len().min(256);
+    
+    for i in 0..count {
+        scores[i] = score_move(board, moves[i], tt_move, killers, counter_move, history, color);
+    }
+    
+    // Selection sort by scores (in-place, no allocation)
+    for i in 0..count {
+        let mut best_idx = i;
+        let mut best_score = scores[i];
+        
+        for j in (i + 1)..count {
+            if scores[j] > best_score {
+                best_score = scores[j];
+                best_idx = j;
+            }
+        }
+        
+        if best_idx != i {
+            moves.swap(i, best_idx);
+            scores.swap(i, best_idx);
+        }
     }
 }
 
-/// Order moves without counter-move
 #[allow(dead_code)]
 pub fn order_moves_with_tt_and_killers(
     board: &Board, 
@@ -118,19 +252,29 @@ pub fn order_moves_with_tt_and_killers(
     order_moves_full(board, moves, tt_move, killers, None, &dummy_history, Color::White);
 }
 
-/// Order captures for quiescence search (MVV-LVA + SEE filtering)
+#[allow(dead_code)]
 pub fn order_captures(board: &Board, moves: &mut [Move]) {
-    let mut scored: Vec<(Move, i32)> = moves.iter()
-        .map(|&m| {
-            let see_val = see::see(board, m);
-            // Use SEE as primary, MVV-LVA as tiebreaker
-            (m, see_val * 1000 + mvv_lva_score(board, m))
-        })
-        .collect();
-
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-
-    for (i, (m, _)) in scored.into_iter().enumerate() {
-        moves[i] = m;
+    let mut scores: [i32; 256] = [0; 256];
+    let count = moves.len().min(256);
+    
+    for i in 0..count {
+        scores[i] = mvv_lva_score(board, moves[i]);
+    }
+    
+    for i in 0..count {
+        let mut best_idx = i;
+        let mut best_score = scores[i];
+        
+        for j in (i + 1)..count {
+            if scores[j] > best_score {
+                best_score = scores[j];
+                best_idx = j;
+            }
+        }
+        
+        if best_idx != i {
+            moves.swap(i, best_idx);
+            scores.swap(i, best_idx);
+        }
     }
 }

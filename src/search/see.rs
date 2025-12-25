@@ -1,7 +1,7 @@
 //! Static Exchange Evaluation (SEE)
 //!
 //! Determines if a capture sequence is winning, losing, or neutral.
-//! Used for move ordering and pruning bad captures.
+//! Uses fixed-size arrays to avoid allocations.
 
 use crate::types::{Board, Move, piece_value};
 use chess::{BitBoard, Piece, Color, Square, EMPTY};
@@ -16,54 +16,50 @@ fn see_piece_value(piece: Piece) -> i32 {
 }
 
 /// Get least valuable attacker of a square
+#[inline]
 fn get_lva(board: &Board, sq: Square, side: Color, occupied: BitBoard) -> Option<(Square, Piece)> {
     // Check each piece type from least to most valuable
-    for &piece in &[Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King] {
+    for piece in [Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King] {
         let attackers = get_piece_attacks(board, sq, piece, side, occupied);
         if attackers != EMPTY {
-            // Get any attacker square
-            let attacker_sq = attackers.to_square();
-            return Some((attacker_sq, piece));
+            return Some((attackers.to_square(), piece));
         }
     }
     None
 }
 
 /// Get attacks from a specific piece type to a square
+#[inline]
 fn get_piece_attacks(board: &Board, target: Square, piece: Piece, side: Color, occupied: BitBoard) -> BitBoard {
     let our_pieces = board.pieces(piece) & board.color_combined(side) & occupied;
     
     match piece {
         Piece::Pawn => {
-            // Pawn attacks the target
             let pawn_attacks = chess::get_pawn_attacks(target, !side, EMPTY);
             our_pieces & pawn_attacks
         }
         Piece::Knight => {
-            let knight_attacks = chess::get_knight_moves(target);
-            our_pieces & knight_attacks
+            our_pieces & chess::get_knight_moves(target)
         }
         Piece::Bishop => {
-            let bishop_attacks = chess::get_bishop_moves(target, occupied);
-            our_pieces & bishop_attacks
+            our_pieces & chess::get_bishop_moves(target, occupied)
         }
         Piece::Rook => {
-            let rook_attacks = chess::get_rook_moves(target, occupied);
-            our_pieces & rook_attacks
+            our_pieces & chess::get_rook_moves(target, occupied)
         }
         Piece::Queen => {
-            let queen_attacks = chess::get_bishop_moves(target, occupied) | chess::get_rook_moves(target, occupied);
-            our_pieces & queen_attacks
+            our_pieces & (chess::get_bishop_moves(target, occupied) | chess::get_rook_moves(target, occupied))
         }
         Piece::King => {
-            let king_attacks = chess::get_king_moves(target);
-            our_pieces & king_attacks
+            our_pieces & chess::get_king_moves(target)
         }
     }
 }
 
 /// Static Exchange Evaluation
-/// Returns the material balance after a capture sequence
+/// Returns the material balance after a capture sequence.
+/// Uses fixed-size array to avoid allocations.
+#[inline]
 pub fn see(board: &Board, mv: Move) -> i32 {
     let from = mv.get_source();
     let to = mv.get_dest();
@@ -90,28 +86,26 @@ pub fn see(board: &Board, mv: Move) -> i32 {
         gain += see_piece_value(promo) - see_piece_value(Piece::Pawn);
     }
 
-    let mut balance = gain;
+    // Fixed-size gains stack (max 32 captures possible)
+    let mut gains: [i32; 32] = [0; 32];
+    let mut depth = 0;
+    gains[depth] = gain;
+    depth += 1;
+
     let mut occupied = *board.combined() ^ BitBoard::from_square(from);
     let mut side = !board.side_to_move();
     let mut last_value = see_piece_value(attacker_piece);
     
-    // Stack for negamax-style evaluation
-    let mut gains = vec![gain];
-    
     // Simulate the exchange
     loop {
-        // Find least valuable attacker
         if let Some((sq, piece)) = get_lva(board, to, side, occupied) {
-            // Remove attacker from occupied
             occupied ^= BitBoard::from_square(sq);
-            
-            // Value we can capture
-            gains.push(last_value);
+            gains[depth] = last_value;
             last_value = see_piece_value(piece);
-            
+            depth += 1;
             side = !side;
             
-            // King capture ends the sequence (illegal for opponent to recapture)
+            // King capture ends the sequence
             if piece == Piece::King {
                 break;
             }
@@ -120,14 +114,13 @@ pub fn see(board: &Board, mv: Move) -> i32 {
         }
     }
     
-    // Evaluate from the end (like negamax)
-    while gains.len() > 1 {
-        let their_gain = gains.pop().unwrap();
-        let our_score = gains.last_mut().unwrap();
-        *our_score = (*our_score).max(-their_gain);
+    // Negamax-style evaluation from the end
+    while depth > 1 {
+        depth -= 1;
+        gains[depth - 1] = gains[depth - 1].max(-gains[depth]);
     }
     
-    gains.pop().unwrap_or(0)
+    gains[0]
 }
 
 /// Check if SEE is greater than or equal to threshold

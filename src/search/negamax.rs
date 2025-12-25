@@ -169,10 +169,19 @@ pub fn search(
     // Order moves (TT, killers, counter-move, and history)
     ordering::order_moves_full(board, &mut moves, tt_move, killers, counter_move, &searcher.history, color);
 
+    // Cache static eval for futility pruning (only compute once per node)
+    let static_eval = if depth.raw() <= 3 && !in_check {
+        Some(eval::evaluate(board, searcher.nnue.as_ref()))
+    } else {
+        None
+    };
+
     let mut best_move = None;
     let mut best_score = Score::neg_infinity();
     let mut pv = Vec::new();
-    let mut searched_quiets: Vec<Move> = Vec::new();
+    // Use fixed-size array for searched quiets to avoid allocations
+    let mut searched_quiets: [Move; 64] = [Move::default(); 64];
+    let mut quiets_count = 0usize;
 
     for (move_idx, &m) in moves.iter().enumerate() {
         let new_board = board.make_move_new(m);
@@ -214,15 +223,17 @@ pub fn search(
 
         // === Futility Pruning ===
         // At shallow depths, skip quiet moves if eval + margin is below alpha
-        if depth.raw() <= 3 && !in_check && is_quiet && !gives_check && move_idx > 0 {
-            let margin = 100 * depth.raw();
-            let static_eval = eval::evaluate(board, searcher.nnue.as_ref());
-            if static_eval.raw() + margin < alpha.raw() {
-                // Track for history
-                if is_quiet {
-                    searched_quiets.push(m);
+        if let Some(se) = static_eval {
+            if is_quiet && !gives_check && move_idx > 0 {
+                let margin = 100 * depth.raw();
+                if se.raw() + margin < alpha.raw() {
+                    // Track for history
+                    if quiets_count < 64 {
+                        searched_quiets[quiets_count] = m;
+                        quiets_count += 1;
+                    }
+                    continue;  // Prune this move
                 }
-                continue;  // Prune this move
             }
         }
 
@@ -308,7 +319,7 @@ pub fn search(
                     if is_quiet {
                         searcher.killers.store(ply, m);
                         // Update history: bonus for cutoff move, penalty for searched quiets
-                        searcher.history.update_on_cutoff(color, m, depth.raw(), &searched_quiets);
+                        searcher.history.update_on_cutoff(color, m, depth.raw(), &searched_quiets[..quiets_count]);
                         // Update counter-move
                         if let Some(pm) = prev_move {
                             searcher.countermoves.store(pm, m);
@@ -320,8 +331,9 @@ pub fn search(
         }
         
         // Track searched quiet moves for history penalty
-        if is_quiet {
-            searched_quiets.push(m);
+        if is_quiet && quiets_count < 64 {
+            searched_quiets[quiets_count] = m;
+            quiets_count += 1;
         }
     }
 
