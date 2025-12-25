@@ -388,7 +388,7 @@ fn quiescence(
     searcher.update_seldepth(ply);
 
     // Stand-pat evaluation
-    let stand_pat = eval::evaluate(board, searcher.nnue.as_ref());
+    let stand_pat = crate::eval::evaluate(board, searcher.nnue.as_ref());
 
     if stand_pat >= beta {
         return SearchResult {
@@ -403,12 +403,18 @@ fn quiescence(
         alpha = stand_pat;
     }
 
-    // Generate capture moves only
-    let mut moves: Vec<Move> = MoveGen::new_legal(board)
-        .filter(|m| board.piece_on(m.get_dest()).is_some())
-        .collect();
+    // Generate capture moves only - use fixed array
+    let mut moves: [Move; 64] = [Move::default(); 64];
+    let mut move_count = 0;
+    
+    for m in MoveGen::new_legal(board) {
+        if board.piece_on(m.get_dest()).is_some() && move_count < 64 {
+            moves[move_count] = m;
+            move_count += 1;
+        }
+    }
 
-    if moves.is_empty() {
+    if move_count == 0 {
         return SearchResult {
             best_move: None,
             score: alpha,
@@ -417,12 +423,13 @@ fn quiescence(
         };
     }
 
-    ordering::order_captures(board, &mut moves);
+    ordering::order_captures(board, &mut moves[..move_count]);
 
     let mut best_score = stand_pat;
     let mut pv = Vec::new();
 
-    for &m in &moves {
+    for i in 0..move_count {
+        let m = moves[i];
         if searcher.should_stop() {
             break;
         }

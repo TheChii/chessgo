@@ -7,6 +7,9 @@ use crate::types::{Board, Score, Color, Piece, piece_value, Value};
 
 pub mod nnue;
 
+// Re-export the evaluator for use in search
+pub use nnue::NnueEvaluator;
+
 /// Evaluate the position.
 ///
 /// Uses NNUE if a model is provided, otherwise simple material fallback.
@@ -18,6 +21,12 @@ pub fn evaluate(board: &Board, model: Option<&nnue::Model>) -> Score {
         // Fallback to simple material
         material_eval_wrapper(board)
     }
+}
+
+/// Evaluate using an existing NNUE evaluator (incremental - fast!)
+#[inline]
+pub fn evaluate_incremental(evaluator: &mut NnueEvaluator<'_>, side_to_move: Color) -> Score {
+    evaluator.evaluate(side_to_move)
 }
 
 /// Wrapper for material eval that returns Score

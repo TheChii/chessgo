@@ -64,7 +64,8 @@ pub fn evaluate_scratch(model: &SfHalfKpModel, board: &Board) -> Score {
 }
 
 /// Update state for a move (incremental)
-/// Returns true if update succeeded, false if full refresh needed
+/// Returns true if update succeeded, false if full refresh needed (king moved)
+#[inline]
 pub fn update_state_for_move(
     state: &mut SfHalfKpState<'_>,
     board: &Board,  // Position BEFORE the move
@@ -103,6 +104,19 @@ pub fn update_state_for_move(
         }
     }
 
+    // Handle en passant capture
+    if moving_piece == chess::Piece::Pawn && board.en_passant() == Some(to) {
+        // Remove en passant captured pawn
+        let ep_sq = if moving_color == chess::Color::White {
+            chess::Square::make_square(chess::Rank::Fifth, to.get_file()).to_nnue()
+        } else {
+            chess::Square::make_square(chess::Rank::Fourth, to.get_file()).to_nnue()
+        };
+        let cap_color = (!moving_color).to_nnue();
+        state.sub(nnue::Color::White, nnue::Piece::Pawn, cap_color, ep_sq);
+        state.sub(nnue::Color::Black, nnue::Piece::Pawn, cap_color, ep_sq);
+    }
+
     // Handle promotion
     let final_piece = if let Some(promo) = mv.get_promotion() {
         promo.to_nnue()
@@ -117,37 +131,65 @@ pub fn update_state_for_move(
     true
 }
 
-/// Refresh state from board (when incremental update not possible)
-/// Note: Due to lifetime constraints, caller should use create_state instead
-#[allow(dead_code)]
-pub fn refresh_state_inplace<'m>(
-    state: &mut SfHalfKpState<'m>,
-    board: &Board,
-) {
-    // Re-initialize using the existing model reference
-    let white_king = board.king_square(chess::Color::White).to_nnue();
-    let black_king = board.king_square(chess::Color::Black).to_nnue();
-    
-    // Reset kings
-    state.kings = [white_king, black_king.rotate()];
-    
-    // Reset accumulators to biases
-    state.model.transformer.input_layer.empty(&mut state.accumulator[0]);
-    state.model.transformer.input_layer.empty(&mut state.accumulator[1]);
-    
-    // Re-add all pieces
-    for &piece in &[chess::Piece::Pawn, chess::Piece::Knight, chess::Piece::Bishop, 
-                    chess::Piece::Rook, chess::Piece::Queen] {
-        for &color in &[chess::Color::White, chess::Color::Black] {
-            let bb = board.pieces(piece) & board.color_combined(color);
-            let nnue_piece = piece.to_nnue();
-            let nnue_color = color.to_nnue();
-            
-            for sq in bb {
-                let nnue_sq = sq.to_nnue();
-                state.add(nnue::Color::White, nnue_piece, nnue_color, nnue_sq);
-                state.add(nnue::Color::Black, nnue_piece, nnue_color, nnue_sq);
-            }
+/// Refresh state completely from a board position
+#[inline]
+pub fn refresh_state<'m>(state: &mut SfHalfKpState<'m>, model: &'m SfHalfKpModel, board: &Board) {
+    // Create a new state and copy it
+    *state = create_state(model, board);
+}
+
+/// Stateful NNUE evaluator for use in search
+/// Manages a cloneable state for efficient incremental updates
+pub struct NnueEvaluator<'m> {
+    model: &'m SfHalfKpModel,
+    state: SfHalfKpState<'m>,
+}
+
+impl<'m> NnueEvaluator<'m> {
+    /// Create a new evaluator for a position
+    pub fn new(model: &'m SfHalfKpModel, board: &Board) -> Self {
+        Self {
+            model,
+            state: create_state(model, board),
+        }
+    }
+
+    /// Evaluate current position
+    #[inline]
+    pub fn evaluate(&mut self, side_to_move: chess::Color) -> Score {
+        evaluate_state(&mut self.state, side_to_move)
+    }
+
+    /// Update for a move, returns false if refresh needed
+    #[inline]
+    pub fn update_move(&mut self, board: &Board, mv: Move) -> bool {
+        update_state_for_move(&mut self.state, board, mv)
+    }
+
+    /// Refresh state for a new position (after king move or when needed)
+    #[inline]
+    pub fn refresh(&mut self, board: &Board) {
+        self.state = create_state(self.model, board);
+    }
+
+    /// Clone the current state (for search recursion)
+    #[inline]
+    pub fn clone_state(&self) -> SfHalfKpState<'m> {
+        self.state.clone()
+    }
+
+    /// Restore state from a clone
+    #[inline]
+    pub fn restore_state(&mut self, state: SfHalfKpState<'m>) {
+        self.state = state;
+    }
+}
+
+impl<'m> Clone for NnueEvaluator<'m> {
+    fn clone(&self) -> Self {
+        Self {
+            model: self.model,
+            state: self.state.clone(),
         }
     }
 }
