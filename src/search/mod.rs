@@ -23,12 +23,16 @@ mod limits;
 pub mod tt;
 mod killers;
 mod history;
+mod see;
+mod countermove;
 
 pub use limits::{SearchLimits, TimeManager};
 pub use negamax::SearchResult;
 pub use tt::TranspositionTable;
 pub use killers::KillerTable;
 pub use history::HistoryTable;
+pub use countermove::CounterMoveTable;
+pub use see::{see, see_ge, is_good_capture};
 
 use crate::types::{Board, Move, Score, Depth, Ply, NodeCount};
 use crate::eval::nnue;
@@ -64,6 +68,8 @@ pub struct Searcher {
     pub killers: KillerTable,
     /// History heuristic table
     pub history: HistoryTable,
+    /// Counter-move table
+    pub countermoves: CounterMoveTable,
     /// Time manager for search limits
     time_manager: TimeManager,
     /// Search statistics
@@ -87,6 +93,7 @@ impl Searcher {
             tt: TranspositionTable::default(),
             killers: KillerTable::new(),
             history: HistoryTable::new(),
+            countermoves: CounterMoveTable::new(),
             time_manager: TimeManager::new(),
             stats: SearchStats::default(),
             best_move: None,
@@ -207,6 +214,7 @@ impl Searcher {
                     alpha,
                     beta,
                     true,
+                    None,  // No prev move at root
                 );
 
                 if self.should_stop() {

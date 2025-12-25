@@ -3,21 +3,25 @@
 //! Good move ordering is critical for alpha-beta pruning efficiency.
 //! This module provides ordering functions with:
 //! - Transposition table moves (best first)
-//! - Captures via MVV-LVA
+//! - Good captures via SEE (MVV-LVA, skip losing)
 //! - Killer moves (quiet moves that caused cutoffs)
+//! - Counter-moves (moves that refute opponent's last move)
 //! - History heuristic (success rate of quiet moves)
 //! - Promotion bonuses
 
 use crate::types::{Board, Move, piece_value};
 use super::history::HistoryTable;
+use super::see;
 use chess::Color;
 
 /// Move score constants
 const TT_MOVE_BONUS: i32 = 1_000_000;
 const PROMOTION_BONUS: i32 = 100_000;
-const CAPTURE_BONUS: i32 = 50_000;
+const GOOD_CAPTURE_BONUS: i32 = 60_000;
 const KILLER_0_BONUS: i32 = 40_000;
 const KILLER_1_BONUS: i32 = 35_000;
+const COUNTER_MOVE_BONUS: i32 = 30_000;
+const BAD_CAPTURE_PENALTY: i32 = -10_000;
 
 /// MVV-LVA scores for capture ordering
 fn mvv_lva_score(board: &Board, m: Move) -> i32 {
@@ -38,6 +42,7 @@ fn score_move(
     m: Move, 
     tt_move: Option<Move>,
     killers: [Option<Move>; 2],
+    counter_move: Option<Move>,
     history: &HistoryTable,
     color: Color,
 ) -> i32 {
@@ -53,15 +58,24 @@ fn score_move(
         score += piece_value(promo) + PROMOTION_BONUS;
     }
 
-    // Captures scored by MVV-LVA
+    // Captures scored by SEE
     if board.piece_on(m.get_dest()).is_some() {
-        score += mvv_lva_score(board, m) + CAPTURE_BONUS;
+        let see_value = see::see(board, m);
+        if see_value >= 0 {
+            // Good capture: use MVV-LVA within the bonus
+            score += GOOD_CAPTURE_BONUS + mvv_lva_score(board, m);
+        } else {
+            // Bad capture: penalize
+            score += BAD_CAPTURE_PENALTY + mvv_lva_score(board, m);
+        }
     } else {
-        // Quiet move - check killers first
+        // Quiet move - check killers and counter-move
         if killers[0] == Some(m) {
             score += KILLER_0_BONUS;
         } else if killers[1] == Some(m) {
             score += KILLER_1_BONUS;
+        } else if counter_move == Some(m) {
+            score += COUNTER_MOVE_BONUS;
         } else {
             // Use history score for other quiet moves
             score += history.get(color, m);
@@ -71,17 +85,18 @@ fn score_move(
     score
 }
 
-/// Order moves for main search with TT, killers, and history
+/// Order moves for main search with all heuristics
 pub fn order_moves_full(
     board: &Board, 
     moves: &mut [Move], 
     tt_move: Option<Move>,
     killers: [Option<Move>; 2],
+    counter_move: Option<Move>,
     history: &HistoryTable,
     color: Color,
 ) {
     let mut scored: Vec<(Move, i32)> = moves.iter()
-        .map(|&m| (m, score_move(board, m, tt_move, killers, history, color)))
+        .map(|&m| (m, score_move(board, m, tt_move, killers, counter_move, history, color)))
         .collect();
 
     scored.sort_by(|a, b| b.1.cmp(&a.1));
@@ -91,7 +106,8 @@ pub fn order_moves_full(
     }
 }
 
-/// Order moves for main search with TT and killers (no history)
+/// Order moves without counter-move
+#[allow(dead_code)]
 pub fn order_moves_with_tt_and_killers(
     board: &Board, 
     moves: &mut [Move], 
@@ -99,25 +115,17 @@ pub fn order_moves_with_tt_and_killers(
     killers: [Option<Move>; 2],
 ) {
     let dummy_history = HistoryTable::new();
-    order_moves_full(board, moves, tt_move, killers, &dummy_history, Color::White);
+    order_moves_full(board, moves, tt_move, killers, None, &dummy_history, Color::White);
 }
 
-/// Order moves for main search with TT move only (no killers)
-#[allow(dead_code)]
-pub fn order_moves_with_tt(board: &Board, moves: &mut [Move], tt_move: Option<Move>) {
-    order_moves_with_tt_and_killers(board, moves, tt_move, [None, None]);
-}
-
-/// Order moves for main search (without TT move or killers)
-#[allow(dead_code)]
-pub fn order_moves(board: &Board, moves: &mut [Move]) {
-    order_moves_with_tt_and_killers(board, moves, None, [None, None]);
-}
-
-/// Order captures for quiescence search (MVV-LVA only)
+/// Order captures for quiescence search (MVV-LVA + SEE filtering)
 pub fn order_captures(board: &Board, moves: &mut [Move]) {
     let mut scored: Vec<(Move, i32)> = moves.iter()
-        .map(|&m| (m, mvv_lva_score(board, m)))
+        .map(|&m| {
+            let see_val = see::see(board, m);
+            // Use SEE as primary, MVV-LVA as tiebreaker
+            (m, see_val * 1000 + mvv_lva_score(board, m))
+        })
         .collect();
 
     scored.sort_by(|a, b| b.1.cmp(&a.1));

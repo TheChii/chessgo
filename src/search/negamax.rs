@@ -30,6 +30,7 @@ pub fn search(
     mut alpha: Score,
     beta: Score,
     allow_null: bool,
+    prev_move: Option<Move>,
 ) -> SearchResult {
     searcher.inc_nodes();
     searcher.update_seldepth(ply);
@@ -116,7 +117,8 @@ pub fn search(
                     ply.next(),
                     -beta,
                     -beta + Score::cp(1),
-                    false,  // Don't allow consecutive null moves
+                    false,
+                    None,  // No prev move for null move
                 );
                 
                 let null_score = -null_result.score;
@@ -160,9 +162,12 @@ pub fn search(
     // Get killers for this ply
     let killers = searcher.killers.get(ply);
     let color = board.side_to_move();
+    
+    // Get counter-move for opponent's previous move
+    let counter_move = prev_move.and_then(|pm| searcher.countermoves.get(pm));
 
-    // Order moves (TT, killers, and history)
-    ordering::order_moves_full(board, &mut moves, tt_move, killers, &searcher.history, color);
+    // Order moves (TT, killers, counter-move, and history)
+    ordering::order_moves_full(board, &mut moves, tt_move, killers, counter_move, &searcher.history, color);
 
     let mut best_move = None;
     let mut best_score = Score::neg_infinity();
@@ -235,6 +240,7 @@ pub fn search(
                 -beta,
                 -alpha,
                 true,
+                Some(m),  // Pass current move as prev_move
             );
             score = -result.score;
         } else {
@@ -247,6 +253,7 @@ pub fn search(
                 -alpha - Score::cp(1),
                 -alpha,
                 true,
+                Some(m),
             );
             score = -result.score;
             
@@ -260,6 +267,7 @@ pub fn search(
                     -beta,
                     -alpha,
                     true,
+                    Some(m),
                 );
                 score = -result.score;
             }
@@ -275,6 +283,7 @@ pub fn search(
                 -beta,
                 -alpha,
                 true,
+                Some(m),
             );
             score = -result.score;
         }
@@ -295,11 +304,15 @@ pub fn search(
                 alpha = score;
 
                 if score >= beta {
-                    // Beta cutoff - update killer and history for quiet moves
+                    // Beta cutoff - update killer, history, and counter-move for quiet moves
                     if is_quiet {
                         searcher.killers.store(ply, m);
                         // Update history: bonus for cutoff move, penalty for searched quiets
                         searcher.history.update_on_cutoff(color, m, depth.raw(), &searched_quiets);
+                        // Update counter-move
+                        if let Some(pm) = prev_move {
+                            searcher.countermoves.store(pm, m);
+                        }
                     }
                     break;
                 }
