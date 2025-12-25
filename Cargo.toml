@@ -1,0 +1,9 @@
+[package]
+name = "chessinrust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chess = "3"
+nnue = { git = "https://github.com/analog-hors/nnue-rs" }
+binread = "2"
