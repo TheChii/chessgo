@@ -246,6 +246,26 @@ impl Searcher {
             if let Some(start) = self.start_time {
                 self.stats.time_ms = start.elapsed().as_millis() as u64;
             }
+
+            // Print info for this depth
+            if !self.should_stop() {
+                let pv_str: String = self.pv.iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                    
+                println!(
+                    "info depth {} seldepth {} score {} nodes {} nps {} time {} hashfull {} pv {}",
+                    depth,
+                    self.stats.seldepth.raw(),
+                    best_score,
+                    self.stats.nodes,
+                    self.stats.nps(),
+                    self.stats.time_ms,
+                    self.stats.hashfull,
+                    pv_str
+                );
+            }
         }
 
         SearchResult {
