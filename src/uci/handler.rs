@@ -18,6 +18,8 @@ pub struct UciHandler {
     debug: bool,
     /// Should the engine quit
     quit: bool,
+    /// Move overhead in milliseconds (safety buffer for time control)
+    move_overhead: u64,
 }
 
 impl Default for UciHandler {
@@ -47,6 +49,7 @@ impl UciHandler {
             searcher,
             debug: false,
             quit: false,
+            move_overhead: 10, // Default 10ms
         }
     }
 
@@ -111,8 +114,8 @@ impl UciHandler {
         self.send(&format!("id name {}", ENGINE_NAME));
         self.send(&format!("id author {}", ENGINE_AUTHOR));
         
-        // Send options here
-        // self.send("option name Hash type spin default 16 min 1 max 1024");
+        // Send options
+        self.send("option name MoveOverhead type spin default 10 min 0 max 5000");
         
         self.send("uciok");
     }
@@ -125,8 +128,21 @@ impl UciHandler {
         self.send("readyok");
     }
 
-    fn cmd_setoption(&mut self, _name: &str, _value: Option<&str>) {
-        // TODO: Handle options like Hash size, Threads, etc.
+    fn cmd_setoption(&mut self, name: &str, value: Option<&str>) {
+        match name.to_lowercase().as_str() {
+            "moveoverhead" => {
+                if let Some(v) = value {
+                    if let Ok(ms) = v.parse::<u64>() {
+                        self.move_overhead = ms.min(5000);
+                    }
+                }
+            }
+            _ => {
+                if self.debug {
+                    eprintln!("Unknown option: {}", name);
+                }
+            }
+        }
     }
 
     fn cmd_ucinewgame(&mut self) {
@@ -161,8 +177,9 @@ impl UciHandler {
     }
 
     fn cmd_go(&mut self, params: SearchParams) {
-        // Set up search limits
-        let limits = SearchLimits::from_params(&params);
+        // Set up search limits with move overhead
+        let limits = SearchLimits::from_params(&params)
+            .with_move_overhead(self.move_overhead);
         
         // Set position and run search
         self.searcher.set_position(self.board);

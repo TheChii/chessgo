@@ -105,12 +105,14 @@ pub struct Searcher {
     pv: Vec<Move>,
     /// Should stop searching
     stop: bool,
-    /// Start time of search
-    start_time: Option<Instant>,
     /// NNUE Model (thread-safe reference)
     pub nnue: Option<nnue::Model>,
     /// Position history for repetition detection (stores Zobrist hashes)
     pub position_history: Vec<u64>,
+    /// Move stability counter (how many iterations best move unchanged)
+    stable_move_count: u32,
+    /// Last iteration's best move for stability tracking
+    last_best_move: Option<Move>,
 }
 
 impl Searcher {
@@ -126,9 +128,10 @@ impl Searcher {
             best_move: None,
             pv: Vec::new(),
             stop: false,
-            start_time: None,
             nnue: None,
             position_history: Vec::with_capacity(512),
+            stable_move_count: 0,
+            last_best_move: None,
         }
     }
 
@@ -184,7 +187,7 @@ impl Searcher {
         self.stop = true;
     }
 
-    /// Check if search should stop (time limit, nodes limit, etc.)
+    /// Check if search should stop (hard time limit, nodes limit, etc.)
     pub fn should_stop(&self) -> bool {
         if self.stop {
             return true;
@@ -192,15 +195,36 @@ impl Searcher {
         
         // Check time periodically (every 2048 nodes for efficiency)
         if self.stats.nodes & 2047 == 0 {
-            if let Some(start) = self.start_time {
-                let elapsed = start.elapsed().as_millis() as u64;
-                if self.time_manager.should_stop(elapsed) {
-                    return true;
-                }
+            if self.time_manager.hard_limit_exceeded() {
+                return true;
             }
         }
         
         false
+    }
+    
+    /// Check if we can start a new iteration (soft time limit)
+    fn can_start_new_iteration(&self) -> bool {
+        if self.stop {
+            return false;
+        }
+        
+        // Check soft limit
+        if !self.time_manager.can_start_iteration() {
+            return false;
+        }
+        
+        // Early termination: if best move has been stable for 4+ iterations
+        // and we've used more than 20% of soft limit, we can stop early
+        if self.stable_move_count >= 4 {
+            let elapsed = self.time_manager.elapsed();
+            let soft = self.time_manager.soft_limit_ms();
+            if elapsed > soft / 5 {
+                return false;
+            }
+        }
+        
+        true
     }
 
     /// Run the search with given limits
@@ -209,7 +233,8 @@ impl Searcher {
         self.stats = SearchStats::default();
         self.best_move = None;
         self.pv.clear();
-        self.start_time = Some(Instant::now());
+        self.stable_move_count = 0;
+        self.last_best_move = None;
         
         // Increment TT generation for new search
         self.tt.new_search();
@@ -235,7 +260,8 @@ impl Searcher {
         let mut root_evaluator = SearchEvaluator::new(local_nnue.as_ref(), &self.board);
         
         for depth in 1..=max_depth.raw() {
-            if self.should_stop() {
+            // Check if we can start a new iteration
+            if !self.can_start_new_iteration() {
                 break;
             }
 
@@ -299,17 +325,21 @@ impl Searcher {
             self.stats.depth = Depth::new(depth);
             self.stats.hashfull = self.tt.hashfull();
             
-            // Update time
-            if let Some(start) = self.start_time {
-                self.stats.time_ms = start.elapsed().as_millis() as u64;
+            // Update time from time manager
+            self.stats.time_ms = self.time_manager.elapsed();
+            
+            // Track move stability for early termination
+            if self.best_move == self.last_best_move {
+                self.stable_move_count += 1;
+            } else {
+                self.stable_move_count = 0;
+                self.last_best_move = self.best_move;
             }
 
             // Print info for this depth
             if !self.should_stop() {
                 self.stats.print_profiling();
-                if let Some(start) = self.start_time {
-                   self.stats.time_search = start.elapsed().as_nanos() as u64;
-                }
+                self.stats.time_search = (self.time_manager.elapsed() as u64) * 1_000_000; // convert ms to ns approximation
                 let pv_str: String = self.pv.iter()
                     .map(|m| m.to_string())
                     .collect::<Vec<_>>()

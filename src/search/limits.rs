@@ -5,9 +5,11 @@
 //! - Fixed time search
 //! - Time control with increment
 //! - Infinite search (until stop)
+//! - Soft/hard time limits for optimal iteration control
 
 use crate::types::{Depth, Color};
 use crate::uci::SearchParams;
+use std::time::Instant;
 
 /// Search limits configuration
 #[derive(Debug, Clone, Default)]
@@ -30,16 +32,22 @@ pub struct SearchLimits {
     pub movestogo: Option<u32>,
     /// Infinite search
     pub infinite: bool,
+    /// Move overhead (safety buffer for network/GUI delay)
+    pub move_overhead: u64,
 }
 
 impl SearchLimits {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            move_overhead: 10, // Default 10ms safety buffer
+            ..Default::default()
+        }
     }
 
     pub fn depth(depth: i32) -> Self {
         Self {
             depth: Some(Depth::new(depth)),
+            move_overhead: 10,
             ..Default::default()
         }
     }
@@ -55,27 +63,40 @@ impl SearchLimits {
             binc: params.binc,
             movestogo: params.movestogo,
             infinite: params.infinite,
+            move_overhead: 10, // Default, can be overridden via UCI
         }
+    }
+    
+    /// Set move overhead (from UCI option)
+    pub fn with_move_overhead(mut self, overhead: u64) -> Self {
+        self.move_overhead = overhead;
+        self
     }
 }
 
-/// Time manager for search
+/// Time manager for search with soft and hard limits
 #[derive(Debug, Clone)]
 pub struct TimeManager {
-    /// Allocated time for this move (ms)
-    allocated_time: u64,
-    /// Maximum time allowed (hard limit)
-    max_time: u64,
+    /// Soft time limit - target time to use (stop after iteration)
+    soft_limit: u64,
+    /// Hard time limit - absolute maximum (stop mid-search if exceeded)
+    hard_limit: u64,
+    /// Move overhead safety buffer
+    move_overhead: u64,
     /// Is this an infinite search?
     infinite: bool,
+    /// Start time of search
+    start_time: Option<Instant>,
 }
 
 impl TimeManager {
     pub fn new() -> Self {
         Self {
-            allocated_time: u64::MAX,
-            max_time: u64::MAX,
+            soft_limit: u64::MAX,
+            hard_limit: u64::MAX,
+            move_overhead: 10,
             infinite: true,
+            start_time: None,
         }
     }
 
@@ -85,12 +106,17 @@ impl TimeManager {
             return Self::new();
         }
 
+        let move_overhead = limits.move_overhead;
+
         // Fixed movetime
         if let Some(mt) = limits.movetime {
+            let effective = mt.saturating_sub(move_overhead);
             return Self {
-                allocated_time: mt,
-                max_time: mt,
+                soft_limit: effective,
+                hard_limit: effective,
+                move_overhead,
                 infinite: false,
+                start_time: Some(Instant::now()),
             };
         }
 
@@ -103,57 +129,166 @@ impl TimeManager {
         if let Some(time) = time_left {
             let inc = increment.unwrap_or(0);
             let moves_to_go = limits.movestogo.unwrap_or(30) as u64;
-
-            // Simple time allocation:
-            // Use time_left / moves_to_go + some portion of increment
-            let base_time = time / moves_to_go.max(1);
-            let inc_bonus = inc * 3 / 4;
-
-            let allocated = base_time + inc_bonus;
-            // Don't use more than 1/3 of remaining time
-            let max = time / 3;
-
+            
+            // Subtract overhead from available time
+            let available = time.saturating_sub(move_overhead);
+            
+            // Base time allocation
+            let base_time = available / moves_to_go.max(1);
+            
+            // Add portion of increment to soft limit
+            let inc_bonus = (inc * 3) / 4;
+            
+            // Soft limit: base + increment bonus
+            let soft = (base_time + inc_bonus).min(available);
+            
+            // Hard limit: min(3x soft, 25% of available time)
+            // This prevents using too much time on one move
+            let hard = (soft * 3).min(available / 4).max(soft);
+            
             return Self {
-                allocated_time: allocated.min(max),
-                max_time: max,
+                soft_limit: soft,
+                hard_limit: hard,
+                move_overhead,
                 infinite: false,
+                start_time: Some(Instant::now()),
             };
         }
 
         // Fallback to infinite
         Self::new()
     }
+    
+    /// Start the timer (call at search start)
+    pub fn start(&mut self) {
+        self.start_time = Some(Instant::now());
+    }
 
-    /// Check if we should stop searching
-    pub fn should_stop(&self, elapsed_ms: u64) -> bool {
+    /// Get elapsed time in milliseconds
+    pub fn elapsed(&self) -> u64 {
+        self.start_time
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Check if we should stop searching (hard limit - for mid-search check)
+    pub fn should_stop(&self) -> bool {
         if self.infinite {
             return false;
         }
-        elapsed_ms >= self.allocated_time
+        self.elapsed() >= self.hard_limit
     }
 
-    /// Check if we can start a new iteration
-    #[allow(dead_code)]
-    pub fn can_start_iteration(&self, elapsed_ms: u64) -> bool {
+    /// Check if we can start a new iteration (soft limit)
+    pub fn can_start_iteration(&self) -> bool {
         if self.infinite {
             return true;
         }
-        // Start new iteration if we have at least 50% of allocated time left
-        elapsed_ms < self.allocated_time / 2
+        // Start new iteration if we have time remaining below soft limit
+        // and predict we can complete at least a partial iteration
+        self.elapsed() < self.soft_limit
     }
 
-    /// Should we stop now regardless of iteration?
-    #[allow(dead_code)]
-    pub fn hard_stop(&self, elapsed_ms: u64) -> bool {
+    /// Check if we've exceeded soft limit (use between iterations)
+    pub fn soft_limit_exceeded(&self) -> bool {
         if self.infinite {
             return false;
         }
-        elapsed_ms >= self.max_time
+        self.elapsed() >= self.soft_limit
+    }
+
+    /// Hard stop check (absolute limit - never exceed)
+    pub fn hard_limit_exceeded(&self) -> bool {
+        if self.infinite {
+            return false;
+        }
+        self.elapsed() >= self.hard_limit
+    }
+    
+    /// Extend time limits (when search is in trouble, e.g., score dropped)
+    /// factor > 1.0 extends time, factor < 1.0 reduces time
+    #[allow(dead_code)]
+    pub fn extend_time(&mut self, factor: f64) {
+        if !self.infinite {
+            self.soft_limit = ((self.soft_limit as f64) * factor) as u64;
+            // Hard limit extends less aggressively
+            self.hard_limit = ((self.hard_limit as f64) * factor.sqrt()) as u64;
+        }
+    }
+    
+    /// Get the soft limit in ms
+    pub fn soft_limit_ms(&self) -> u64 {
+        self.soft_limit
+    }
+    
+    /// Get the hard limit in ms
+    pub fn hard_limit_ms(&self) -> u64 {
+        self.hard_limit
+    }
+    
+    /// Check if this is an infinite search
+    pub fn is_infinite(&self) -> bool {
+        self.infinite
     }
 }
 
 impl Default for TimeManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_fixed_movetime() {
+        let limits = SearchLimits {
+            movetime: Some(1000),
+            move_overhead: 10,
+            ..Default::default()
+        };
+        let tm = TimeManager::from_limits(&limits, Color::White);
+        
+        assert!(!tm.is_infinite());
+        assert_eq!(tm.soft_limit_ms(), 990); // 1000 - 10 overhead
+        assert_eq!(tm.hard_limit_ms(), 990);
+    }
+    
+    #[test]
+    fn test_time_control() {
+        let limits = SearchLimits {
+            wtime: Some(60000),
+            btime: Some(60000),
+            winc: Some(1000),
+            binc: Some(1000),
+            move_overhead: 10,
+            ..Default::default()
+        };
+        let tm = TimeManager::from_limits(&limits, Color::White);
+        
+        assert!(!tm.is_infinite());
+        // 60000 - 10 = 59990 available
+        // base = 59990 / 30 = ~1999
+        // inc_bonus = 1000 * 0.75 = 750
+        // soft = ~2749
+        assert!(tm.soft_limit_ms() > 2000);
+        assert!(tm.soft_limit_ms() < 4000);
+        // hard = min(3 * soft, available / 4)
+        assert!(tm.hard_limit_ms() >= tm.soft_limit_ms());
+    }
+    
+    #[test]
+    fn test_infinite() {
+        let limits = SearchLimits {
+            infinite: true,
+            ..Default::default()
+        };
+        let tm = TimeManager::from_limits(&limits, Color::White);
+        
+        assert!(tm.is_infinite());
+        assert!(tm.can_start_iteration());
+        assert!(!tm.should_stop());
     }
 }
