@@ -182,6 +182,7 @@ impl Searcher {
                 Ply::ZERO,
                 Score::neg_infinity(),
                 Score::infinity(),
+                true,  // Allow null move at root
             );
 
             // Only update best move if search completed this depth

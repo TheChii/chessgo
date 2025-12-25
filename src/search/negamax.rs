@@ -21,7 +21,7 @@ pub struct SearchResult {
     pub stats: SearchStats,
 }
 
-/// Main negamax search function with TT integration
+/// Main negamax search function with TT integration and null move pruning
 pub fn search(
     searcher: &mut Searcher,
     board: &Board,
@@ -29,6 +29,7 @@ pub fn search(
     ply: Ply,
     mut alpha: Score,
     beta: Score,
+    allow_null: bool,
 ) -> SearchResult {
     searcher.inc_nodes();
     searcher.update_seldepth(ply);
@@ -92,6 +93,47 @@ pub fn search(
         };
     }
 
+    let in_check = *board.checkers() != chess::EMPTY;
+
+    // === Null Move Pruning ===
+    // Skip if: in check, depth too low, null move disabled, or only king+pawns
+    if allow_null && !in_check && depth.raw() >= 3 {
+        // Don't do null move in pure pawn endgames (zugzwang risk)
+        let dominated_by_pawns = (board.pieces(chess::Piece::Knight)
+            | board.pieces(chess::Piece::Bishop)
+            | board.pieces(chess::Piece::Rook)
+            | board.pieces(chess::Piece::Queen)).popcnt() == 0;
+        
+        if !dominated_by_pawns {
+            // Reduction: R=3 if depth > 6, else R=2
+            let r = if depth.raw() > 6 { 3 } else { 2 };
+            
+            if let Some(null_board) = board.null_move() {
+                let null_result = search(
+                    searcher,
+                    &null_board,
+                    Depth::new((depth.raw() - 1 - r).max(0)),
+                    ply.next(),
+                    -beta,
+                    -beta + Score::cp(1),
+                    false,  // Don't allow consecutive null moves
+                );
+                
+                let null_score = -null_result.score;
+                
+                if null_score >= beta {
+                    // Null move cutoff
+                    return SearchResult {
+                        best_move: None,
+                        score: beta,
+                        pv: Vec::new(),
+                        stats: searcher.stats().clone(),
+                    };
+                }
+            }
+        }
+    }
+
     // Generate legal moves
     let mut moves: Vec<Move> = MoveGen::new_legal(board).collect();
 
@@ -138,6 +180,7 @@ pub fn search(
             ply.next(),
             -beta,
             -alpha,
+            true,  // Allow null move in recursive search
         );
 
         let score = -result.score;
