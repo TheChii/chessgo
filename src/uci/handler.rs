@@ -32,15 +32,32 @@ impl UciHandler {
     pub fn new() -> Self {
         let mut searcher = Searcher::new();
         
-        // Attempt to load NNUE model
-        let nnue_path = "network.nnue";
-        match nnue::load_model(nnue_path) {
+        // Attempt to load NNUE model (look next to executable first, then current dir)
+        let exe_dir_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("network.nnue")));
+        
+        let nnue_path = if let Some(ref p) = exe_dir_path {
+            if p.exists() {
+                println!("info string Found NNUE next to exe: {:?}", p);
+                p.clone()
+            } else {
+                println!("info string NNUE not at exe path: {:?}", p);
+                std::path::PathBuf::from("network.nnue")
+            }
+        } else {
+            println!("info string Could not determine exe path");
+            std::path::PathBuf::from("network.nnue")
+        };
+        
+        match nnue::load_model(nnue_path.to_str().unwrap_or("network.nnue")) {
             Ok(model) => {
-                eprintln!("info string NNUE model loaded: {}", model.desc);
+                println!("info string NNUE loaded: {}", model.desc);
                 searcher.set_nnue(Some(model));
             },
-            Err(_) => {
-                eprintln!("info string Warning: network.nnue not found. Using material fallback.");
+            Err(e) => {
+                println!("info string NNUE load failed: {:?}", e);
+                println!("info string Using material eval");
             }
         }
 
@@ -154,9 +171,14 @@ impl UciHandler {
     }
 
     fn cmd_ucinewgame(&mut self) {
+        // Preserve NNUE model before resetting
+        let nnue_model = self.searcher.nnue.take();
+        
         self.board = Board::default();
         self.searcher = Searcher::new();
-        // TODO: Clear transposition table, history, etc.
+        
+        // Restore NNUE model
+        self.searcher.nnue = nnue_model;
     }
 
     fn cmd_position(&mut self, fen: Option<&str>, moves: &[String]) {
