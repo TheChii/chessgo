@@ -63,8 +63,27 @@ pub fn evaluate_scratch(model: &SfHalfKpModel, board: &Board) -> Score {
     evaluate_state(&mut state, board.side_to_move())
 }
 
+/// Helper: add all non-king pieces to one side of the accumulator
+#[inline]
+fn refresh_side_accumulator(state: &mut SfHalfKpState<'_>, board: &Board, perspective: nnue::Color) {
+    // Add all non-king pieces for this perspective
+    for &piece in &[chess::Piece::Pawn, chess::Piece::Knight, chess::Piece::Bishop, 
+                    chess::Piece::Rook, chess::Piece::Queen] {
+        for &color in &[chess::Color::White, chess::Color::Black] {
+            let bb = board.pieces(piece) & board.color_combined(color);
+            let nnue_piece = piece.to_nnue();
+            let nnue_color = color.to_nnue();
+            
+            for sq in bb {
+                let nnue_sq = sq.to_nnue();
+                state.add(perspective, nnue_piece, nnue_color, nnue_sq);
+            }
+        }
+    }
+}
+
 /// Update state for a move (incremental)
-/// Returns true if update succeeded, false if full refresh needed (king moved)
+/// Returns true if update succeeded, false if full refresh needed
 #[inline]
 pub fn update_state_for_move(
     state: &mut SfHalfKpState<'_>,
@@ -80,11 +99,72 @@ pub fn update_state_for_move(
     let moving_color = board.side_to_move();
     let captured = board.piece_on(to);
 
-    // King moves require full refresh (king position changes feature indexing)
+    // === King Move Handling (Optimized) ===
+    // In HalfKP, the King is NOT a feature - only non-king pieces are features.
+    // The king position is used to INDEX features for other pieces.
+    // Therefore:
+    // - Passive side: NO UPDATE needed (enemy king is not a feature)
+    // - Active side: Full refresh (all feature indices change with king position)
     if moving_piece == chess::Piece::King {
-        return false;
+        let active = moving_color.to_nnue();
+        let passive = (!moving_color).to_nnue();
+        let to_sq = to.to_nnue();
+        
+        // Handle capture for passive side BEFORE updating king
+        // (captured piece IS a feature that needs to be removed)
+        if let Some(captured_piece) = captured {
+            if captured_piece != chess::Piece::King {
+                let cap_nnue = captured_piece.to_nnue();
+                let cap_color = (!moving_color).to_nnue();
+                let cap_sq = to.to_nnue();
+                state.sub(passive, cap_nnue, cap_color, cap_sq);
+            }
+        }
+        
+        // Active side: update king position and clear accumulator
+        state.update_king(active, to_sq);
+        
+        // Create a temporary board with the move applied to rebuild active side
+        let new_board = board.make_move_new(mv);
+        
+        // Refresh the active side's accumulator with all pieces
+        refresh_side_accumulator(state, &new_board, active);
+        
+        // Handle castling: rook also moves (rook IS a feature)
+        let is_castling = (from.get_file() == chess::File::E) 
+            && (to.get_file() == chess::File::G || to.get_file() == chess::File::C);
+        
+        if is_castling {
+            // Determine rook squares based on castling type
+            let nnue_rook_color = moving_color.to_nnue();
+            let (rook_from, rook_to) = if to.get_file() == chess::File::G {
+                // King-side castling
+                let rank = from.get_rank();
+                (
+                    chess::Square::make_square(rank, chess::File::H),
+                    chess::Square::make_square(rank, chess::File::F)
+                )
+            } else {
+                // Queen-side castling
+                let rank = from.get_rank();
+                (
+                    chess::Square::make_square(rank, chess::File::A),
+                    chess::Square::make_square(rank, chess::File::D)
+                )
+            };
+            
+            let rook_from_nnue = rook_from.to_nnue();
+            let rook_to_nnue = rook_to.to_nnue();
+            
+            // Update rook for passive side only (active side was already refreshed)
+            state.sub(passive, nnue::Piece::Rook, nnue_rook_color, rook_from_nnue);
+            state.add(passive, nnue::Piece::Rook, nnue_rook_color, rook_to_nnue);
+        }
+        
+        return true;
     }
 
+    // === Regular piece moves (non-king) ===
     let nnue_piece = moving_piece.to_nnue();
     let nnue_color = moving_color.to_nnue();
     let from_sq = from.to_nnue();
