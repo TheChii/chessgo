@@ -3,3 +3,4 @@ pub mod engine;
 pub mod search;
 pub mod eval;
 pub mod uci;
+pub mod book;

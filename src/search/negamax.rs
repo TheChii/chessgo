@@ -159,7 +159,7 @@ pub fn search(
     // === ProbCut ===
     const PROBCUT_MARGIN: i32 = 200;
     if depth.raw() >= 5 && (beta.raw() - alpha.raw() == 1) && !in_check && beta.raw().abs() < (SCORE_MATE - 1000) {
-        let mut probe_beta = beta + Score::cp(PROBCUT_MARGIN);
+        let probe_beta = beta + Score::cp(PROBCUT_MARGIN);
         let probe_depth = Depth::new(depth.raw() - 4);
 
         let result = search(

@@ -8,7 +8,7 @@
 //! - King safety (midgame) and centralization (endgame)
 //! - Endgame-specific bonuses
 
-use crate::types::{Board, Score, Value};
+use crate::types::{Board, Score};
 use chess::{Color, Piece, Square, BitBoard, Rank, File, EMPTY};
 
 // ============================================================================
@@ -145,7 +145,8 @@ const PASSED_PAWN_BONUS: [i32; 8] = [0, 10, 20, 40, 60, 90, 130, 0]; // by rank 
 const ROOK_ON_OPEN_FILE: i32 = 20;
 const ROOK_ON_SEMI_OPEN: i32 = 10;
 const ROOK_ON_7TH: i32 = 30;
-const MOBILITY_BONUS: i32 = 3; // per legal move
+// Reserved for future mobility evaluation
+// const MOBILITY_BONUS: i32 = 3; // per legal move
 
 // ============================================================================
 // GAME PHASE

@@ -5,6 +5,7 @@ use super::{parse_move, format_move, SearchParams, ENGINE_NAME, ENGINE_AUTHOR};
 use crate::types::{Board, Move, Score};
 use crate::search::{Searcher, SearchLimits};
 use crate::eval::nnue;
+use crate::book::PolyglotBook;
 use std::io::{self, BufRead, Write};
 use std::str::FromStr;
 
@@ -14,6 +15,12 @@ pub struct UciHandler {
     board: Board,
     /// Search engine
     searcher: Searcher,
+    /// Opening book
+    book: Option<PolyglotBook>,
+    /// Use opening book
+    use_own_book: bool,
+    /// Path to opening book file
+    book_path: String,
     /// Debug mode enabled
     debug: bool,
     /// Should the engine quit
@@ -61,9 +68,42 @@ impl UciHandler {
             }
         }
 
+        // Attempt to load opening book (look next to executable first, then current dir)
+        let book_filename = "Human.bin";
+        let exe_dir_book = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(book_filename)));
+        
+        let book_path = if let Some(ref p) = exe_dir_book {
+            if p.exists() {
+                println!("info string Found book next to exe: {:?}", p);
+                p.to_string_lossy().to_string()
+            } else {
+                println!("info string Book not at exe path: {:?}, trying current dir", p);
+                std::path::PathBuf::from(book_filename).to_string_lossy().to_string()
+            }
+        } else {
+            println!("info string Could not determine exe path for book");
+            book_filename.to_string()
+        };
+
+        let book = match PolyglotBook::load(&book_path) {
+            Ok(b) => {
+                println!("info string Opening book loaded: {} ({} entries)", b.desc, b.len());
+                Some(b)
+            }
+            Err(e) => {
+                println!("info string Opening book not loaded: {:?}", e);
+                None
+            }
+        };
+
         Self {
             board: Board::default(),
             searcher,
+            book,
+            use_own_book: true, // Enable book by default
+            book_path,
             debug: false,
             quit: false,
             move_overhead: 10, // Default 10ms
@@ -134,6 +174,8 @@ impl UciHandler {
         // Send options
         self.send("option name Threads type spin default 1 min 1 max 64");
         self.send("option name MoveOverhead type spin default 10 min 0 max 5000");
+        self.send("option name OwnBook type check default true");
+        self.send("option name BookPath type string default Human.bin");
         
         self.send("uciok");
     }
@@ -159,6 +201,30 @@ impl UciHandler {
                 if let Some(v) = value {
                     if let Ok(ms) = v.parse::<u64>() {
                         self.move_overhead = ms.min(5000);
+                    }
+                }
+            }
+            "ownbook" => {
+                if let Some(v) = value {
+                    self.use_own_book = v.to_lowercase() == "true";
+                    if self.debug {
+                        eprintln!("OwnBook set to: {}", self.use_own_book);
+                    }
+                }
+            }
+            "bookpath" => {
+                if let Some(v) = value {
+                    self.book_path = v.to_string();
+                    // Try to load the new book
+                    match PolyglotBook::load(&self.book_path) {
+                        Ok(b) => {
+                            println!("info string Opening book loaded: {} ({} entries)", b.desc, b.len());
+                            self.book = Some(b);
+                        }
+                        Err(e) => {
+                            println!("info string Failed to load book {}: {:?}", self.book_path, e);
+                            self.book = None;
+                        }
                     }
                 }
             }
@@ -207,6 +273,17 @@ impl UciHandler {
     }
 
     fn cmd_go(&mut self, params: SearchParams) {
+        // Try opening book first (unless infinite or analysis mode)
+        if self.use_own_book && !params.infinite && params.searchmoves.is_empty() {
+            if let Some(ref book) = self.book {
+                if let Some(book_move) = book.probe_move(&self.board) {
+                    self.send(&format!("info string book move"));
+                    self.send(&format!("bestmove {}", format_move(book_move)));
+                    return;
+                }
+            }
+        }
+
         // Set up search limits with move overhead
         let limits = SearchLimits::from_params(&params)
             .with_move_overhead(self.move_overhead);

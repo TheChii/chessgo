@@ -85,7 +85,7 @@ pub struct TimeManager {
     /// Hard time limit - absolute maximum (stop mid-search if exceeded)
     hard_limit: u64,
     /// Move overhead safety buffer
-    move_overhead: u64,
+    _move_overhead: u64,
     /// Is this an infinite search?
     infinite: bool,
     /// Start time of search
@@ -97,7 +97,7 @@ impl TimeManager {
         Self {
             soft_limit: u64::MAX,
             hard_limit: u64::MAX,
-            move_overhead: 10,
+            _move_overhead: 10,
             infinite: true,
             start_time: Some(Instant::now()),
         }
@@ -123,7 +123,7 @@ impl TimeManager {
             return Self {
                 soft_limit: soft.max(1),
                 hard_limit: hard.max(1),
-                move_overhead,
+                _move_overhead: move_overhead,
                 infinite: false,
                 start_time: Some(Instant::now()),
             };
@@ -158,7 +158,7 @@ impl TimeManager {
             return Self {
                 soft_limit: soft,
                 hard_limit: hard,
-                move_overhead,
+                _move_overhead: move_overhead,
                 infinite: false,
                 start_time: Some(Instant::now()),
             };
@@ -168,7 +168,7 @@ impl TimeManager {
         Self {
             soft_limit: u64::MAX,
             hard_limit: u64::MAX,
-            move_overhead,
+            _move_overhead: move_overhead,
             infinite: true,
             start_time: Some(Instant::now()),
         }
