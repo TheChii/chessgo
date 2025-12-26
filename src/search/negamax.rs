@@ -83,7 +83,7 @@ pub fn search(
     let mut tt_move: Option<Move> = None;
 
     // === TT Probe ===
-    if let Some(entry) = searcher.tt.probe(hash) {
+    if let Some(entry) = searcher.shared.tt.probe(hash) {
         tt_move = entry.best_move();
         
         // Only use TT score if depth is sufficient
@@ -303,7 +303,7 @@ pub fn search(
         let new_board = board.make_move_new(m);
 
         // Prefetch TT entry for next position
-        searcher.tt.prefetch(new_board.get_hash());
+        searcher.shared.tt.prefetch(new_board.get_hash());
 
         // Determine if this is a quiet move (for LMR)
         let is_capture = board.piece_on(m.get_dest()).is_some();
@@ -494,7 +494,7 @@ pub fn search(
             BoundType::UpperBound
         };
 
-        searcher.tt.store(
+        searcher.shared.tt.store(
             hash,
             best_move,
             best_score.to_tt(ply.raw()),

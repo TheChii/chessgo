@@ -4,11 +4,12 @@
 //! that stores search results to avoid redundant computation.
 //!
 //! # Design
-//! - 16-byte entries for cache efficiency
+//! - 8-byte entries packed into AtomicU64 for lock-free access
 //! - Depth-preferred replacement with age-based eviction
-//! - Lock-free for future multi-threading support
+//! - Lock-free for Lazy SMP multi-threading support
 
 use crate::types::{Move, Score, Depth, Hash};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Type of bound stored in TT entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,15 +38,13 @@ impl From<u8> for BoundType {
 
 /// A single entry in the transposition table.
 ///
-/// Packed into 16 bytes for cache efficiency:
-/// - key: 2 bytes (upper bits of hash for verification)
-/// - best_move: 2 bytes (encoded move)
-/// - score: 2 bytes
-/// - depth: 1 byte
-/// - bound_and_age: 1 byte (bound type in low 2 bits, age in high 6 bits)
-/// - padding: 8 bytes (for alignment, could store more data)
+/// Packed into 8 bytes (64 bits) for atomic access:
+/// - key: 16 bits (upper bits of hash for verification)
+/// - best_move: 16 bits (encoded move)
+/// - score: 16 bits
+/// - depth: 8 bits
+/// - bound_and_age: 8 bits (bound type in low 2 bits, age in high 6 bits)
 #[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
 pub struct TTEntry {
     /// Upper 16 bits of Zobrist hash for verification
     key: u16,
@@ -75,6 +74,29 @@ impl TTEntry {
             score: score.raw() as i16,
             depth: depth.raw() as i8,
             bound_and_age: (bound as u8) | ((generation & 0x3F) << 2),
+        }
+    }
+    
+    /// Pack entry into a u64 for atomic storage
+    /// Layout: key(16) | best_move(16) | score(16) | depth(8) | bound_and_age(8)
+    #[inline]
+    pub fn to_u64(&self) -> u64 {
+        ((self.key as u64) << 48)
+            | ((self.best_move as u64) << 32)
+            | (((self.score as u16) as u64) << 16)
+            | ((self.depth as u8 as u64) << 8)
+            | (self.bound_and_age as u64)
+    }
+    
+    /// Unpack entry from a u64
+    #[inline]
+    pub fn from_u64(raw: u64) -> Self {
+        Self {
+            key: (raw >> 48) as u16,
+            best_move: (raw >> 32) as u16,
+            score: (raw >> 16) as i16,
+            depth: (raw >> 8) as i8,
+            bound_and_age: raw as u8,
         }
     }
 
@@ -166,28 +188,37 @@ fn decode_move(encoded: u16) -> Option<Move> {
     Some(Move::new(from, to, promo))
 }
 
-/// The Transposition Table
+/// Lock-free Transposition Table using AtomicU64
 pub struct TranspositionTable {
-    /// Table entries
-    entries: Vec<TTEntry>,
+    /// Table entries as atomic u64 values
+    entries: Vec<AtomicU64>,
     /// Current generation (incremented each new search)
-    generation: u8,
+    generation: AtomicU8,
     /// Size in MB (for reporting)
     size_mb: usize,
 }
 
+// Safety: AtomicU64 and AtomicU8 are Send + Sync
+unsafe impl Send for TranspositionTable {}
+unsafe impl Sync for TranspositionTable {}
+
 impl TranspositionTable {
     /// Create a new TT with given size in MB
     pub fn new(size_mb: usize) -> Self {
-        let entry_size = std::mem::size_of::<TTEntry>();
+        // TTEntry is 8 bytes
+        let entry_size = 8;
         let num_entries = (size_mb * 1024 * 1024) / entry_size;
         // Round to power of 2 for fast modulo
         let num_entries = num_entries.next_power_of_two() / 2;
         let num_entries = num_entries.max(1024); // Minimum 1024 entries
 
+        let entries = (0..num_entries)
+            .map(|_| AtomicU64::new(0))
+            .collect();
+
         Self {
-            entries: vec![TTEntry::default(); num_entries],
-            generation: 0,
+            entries,
+            generation: AtomicU8::new(0),
             size_mb,
         }
     }
@@ -208,10 +239,17 @@ impl TranspositionTable {
     pub fn size_mb(&self) -> usize {
         self.size_mb
     }
+    
+    /// Get current generation
+    #[inline]
+    pub fn generation(&self) -> u8 {
+        self.generation.load(Ordering::Relaxed)
+    }
 
     /// Increment generation (call at start of each search)
-    pub fn new_search(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+    /// Takes &self for thread-safety - uses atomic operation
+    pub fn new_search(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get index for a hash
@@ -221,10 +259,15 @@ impl TranspositionTable {
         (hash as usize) & (self.entries.len() - 1)
     }
 
-    /// Probe the TT for an entry
+    /// Probe the TT for an entry (lock-free)
     #[inline]
-    pub fn probe(&self, hash: Hash) -> Option<&TTEntry> {
-        let entry = &self.entries[self.index(hash)];
+    pub fn probe(&self, hash: Hash) -> Option<TTEntry> {
+        let raw = self.entries[self.index(hash)].load(Ordering::Relaxed);
+        if raw == 0 {
+            return None;
+        }
+        
+        let entry = TTEntry::from_u64(raw);
         if entry.matches(hash) && !entry.is_empty() {
             Some(entry)
         } else {
@@ -232,11 +275,12 @@ impl TranspositionTable {
         }
     }
 
-    /// Store an entry in the TT
+    /// Store an entry in the TT (lock-free)
     ///
     /// Uses depth-preferred replacement with age consideration
+    /// Takes &self - uses atomic operations for thread-safety
     pub fn store(
-        &mut self,
+        &self,
         hash: Hash,
         best_move: Option<Move>,
         score: Score,
@@ -244,50 +288,50 @@ impl TranspositionTable {
         bound: BoundType,
     ) {
         let idx = self.index(hash);
-        let existing = &self.entries[idx];
+        let existing_raw = self.entries[idx].load(Ordering::Relaxed);
+        let existing = TTEntry::from_u64(existing_raw);
+        let gen = self.generation();
 
         // Replacement strategy:
         // 1. Always replace empty entries
         // 2. Always replace entries from older generations
         // 3. Replace if new depth >= existing depth
         let should_replace = existing.is_empty()
-            || existing.generation() != self.generation
+            || existing.generation() != gen
             || depth.raw() >= existing.depth.into();
 
         if should_replace {
-            self.entries[idx] = TTEntry::new(hash, best_move, score, depth, bound, self.generation);
+            let new_entry = TTEntry::new(hash, best_move, score, depth, bound, gen);
+            self.entries[idx].store(new_entry.to_u64(), Ordering::Relaxed);
         }
     }
 
     /// Clear the table
-    pub fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = TTEntry::default();
+    pub fn clear(&self) {
+        for entry in &self.entries {
+            entry.store(0, Ordering::Relaxed);
         }
-        self.generation = 0;
-    }
-
-    /// Resize the table (typically from UCI setoption)
-    pub fn resize(&mut self, size_mb: usize) {
-        *self = TranspositionTable::new(size_mb);
+        self.generation.store(0, Ordering::Relaxed);
     }
 
     /// Get hashfull in permill (for UCI info)
     pub fn hashfull(&self) -> u32 {
+        let gen = self.generation();
         // Sample first 1000 entries
         let sample_size = self.entries.len().min(1000);
         let used = self.entries[..sample_size]
             .iter()
-            .filter(|e| !e.is_empty() && e.generation() == self.generation)
+            .filter(|e| {
+                let entry = TTEntry::from_u64(e.load(Ordering::Relaxed));
+                !entry.is_empty() && entry.generation() == gen
+            })
             .count();
         ((used * 1000) / sample_size) as u32
     }
 
     /// Prefetch entry for a hash (performance optimization)
-    /// Currently a no-op, can be enabled with target-specific intrinsics
     #[inline]
     pub fn prefetch(&self, hash: Hash) {
-        // Compute index to potentially trigger cache-friendly access
         let _ = self.index(hash);
         // Future: use platform-specific prefetch intrinsics
     }
@@ -305,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_tt_basic() {
-        let mut tt = TranspositionTable::new(1);
+        let tt = TranspositionTable::new(1);
         let hash: Hash = 0x123456789ABCDEF0;
 
         // Initially empty
@@ -331,5 +375,26 @@ mod tests {
         let decoded = decode_move(encoded).unwrap();
         assert_eq!(mv.get_source(), decoded.get_source());
         assert_eq!(mv.get_dest(), decoded.get_dest());
+    }
+    
+    #[test]
+    fn test_entry_pack_unpack() {
+        let entry = TTEntry::new(
+            0xABCD123456789000,
+            None,
+            Score::cp(150),
+            Depth::new(8),
+            BoundType::LowerBound,
+            5,
+        );
+        
+        let packed = entry.to_u64();
+        let unpacked = TTEntry::from_u64(packed);
+        
+        assert_eq!(entry.key, unpacked.key);
+        assert_eq!(entry.score, unpacked.score);
+        assert_eq!(entry.depth, unpacked.depth);
+        assert_eq!(entry.bound(), unpacked.bound());
+        assert_eq!(entry.generation(), unpacked.generation());
     }
 }

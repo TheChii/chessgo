@@ -115,6 +115,7 @@ impl UciHandler {
         self.send(&format!("id author {}", ENGINE_AUTHOR));
         
         // Send options
+        self.send("option name Threads type spin default 1 min 1 max 64");
         self.send("option name MoveOverhead type spin default 10 min 0 max 5000");
         
         self.send("uciok");
@@ -130,6 +131,13 @@ impl UciHandler {
 
     fn cmd_setoption(&mut self, name: &str, value: Option<&str>) {
         match name.to_lowercase().as_str() {
+            "threads" => {
+                if let Some(v) = value {
+                    if let Ok(n) = v.parse::<usize>() {
+                        self.searcher.set_threads(n);
+                    }
+                }
+            }
             "moveoverhead" => {
                 if let Some(v) = value {
                     if let Ok(ms) = v.parse::<u64>() {

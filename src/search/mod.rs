@@ -9,13 +9,8 @@
 //! - `limits`: Search limits and time management
 //! - `tt`: Transposition table for caching search results
 //!
-//! # Future Extensions
-//! The architecture supports adding:
-//! - Null move pruning
-//! - Late move reductions (LMR)
-//! - Aspiration windows
-//! - Principal variation search (PVS)
-//! - Multi-threaded search (Lazy SMP)
+//! # Multi-threading
+//! Implements Lazy SMP with lock-free TT sharing between threads
 
 mod negamax;
 mod qsearch;
@@ -37,7 +32,9 @@ pub use see::{see, see_ge, is_good_capture};
 
 use crate::types::{Board, Move, Score, Depth, Ply, NodeCount};
 use crate::eval::{nnue, SearchEvaluator};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 /// Search statistics collected during search
 #[derive(Debug, Clone, Default)]
@@ -77,9 +74,34 @@ impl SearchStats {
             println!("profiling: gen {}% eval {}% order {}% other {}%", 
                 gen_pct, eval_pct, order_pct, other_pct);
             
-            // Also print raw calls for clarity if requested
              println!("stats: qnodes {} evals {}", self.qnodes, self.eval_calls);
         }
+    }
+}
+
+/// Shared state between search threads
+pub struct SharedState {
+    /// Lock-free transposition table
+    pub tt: TranspositionTable,
+    /// Global stop flag
+    pub stop: AtomicBool,
+    /// Total nodes searched (sum across all threads)
+    pub total_nodes: AtomicU64,
+}
+
+impl SharedState {
+    pub fn new(hash_size_mb: usize) -> Self {
+        Self {
+            tt: TranspositionTable::new(hash_size_mb),
+            stop: AtomicBool::new(false),
+            total_nodes: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for SharedState {
+    fn default() -> Self {
+        Self::new(16)
     }
 }
 
@@ -87,13 +109,13 @@ impl SearchStats {
 pub struct Searcher {
     /// Current board position
     board: Board,
-    /// Transposition table
-    pub tt: TranspositionTable,
-    /// Killer moves table
+    /// Shared state (TT, stop flag) - wrapped in Arc for thread sharing
+    pub shared: Arc<SharedState>,
+    /// Killer moves table (per-thread)
     pub killers: KillerTable,
-    /// History heuristic table
+    /// History heuristic table (per-thread)
     pub history: HistoryTable,
-    /// Counter-move table
+    /// Counter-move table (per-thread)
     pub countermoves: CounterMoveTable,
     /// Time manager for search limits
     time_manager: TimeManager,
@@ -103,8 +125,6 @@ pub struct Searcher {
     best_move: Option<Move>,
     /// Principal variation
     pv: Vec<Move>,
-    /// Should stop searching
-    stop: bool,
     /// NNUE Model (thread-safe reference)
     pub nnue: Option<nnue::Model>,
     /// Position history for repetition detection (stores Zobrist hashes)
@@ -113,13 +133,17 @@ pub struct Searcher {
     stable_move_count: u32,
     /// Last iteration's best move for stability tracking
     last_best_move: Option<Move>,
+    /// Number of threads to use for search
+    num_threads: usize,
+    /// Is this a helper thread (no UCI output)
+    is_helper: bool,
 }
 
 impl Searcher {
     pub fn new() -> Self {
         Self {
             board: Board::default(),
-            tt: TranspositionTable::default(),
+            shared: Arc::new(SharedState::default()),
             killers: KillerTable::new(),
             history: HistoryTable::new(),
             countermoves: CounterMoveTable::new(),
@@ -127,19 +151,30 @@ impl Searcher {
             stats: SearchStats::default(),
             best_move: None,
             pv: Vec::new(),
-            stop: false,
             nnue: None,
             position_history: Vec::with_capacity(512),
             stable_move_count: 0,
             last_best_move: None,
+            num_threads: 1,
+            is_helper: false,
         }
     }
 
     /// Create with specific TT size
     pub fn with_hash_size(size_mb: usize) -> Self {
         let mut s = Self::new();
-        s.tt = TranspositionTable::new(size_mb);
+        s.shared = Arc::new(SharedState::new(size_mb));
         s
+    }
+    
+    /// Set number of search threads
+    pub fn set_threads(&mut self, threads: usize) {
+        self.num_threads = threads.max(1).min(64);
+    }
+    
+    /// Get number of threads
+    pub fn threads(&self) -> usize {
+        self.num_threads
     }
 
     /// Set NNUE model
@@ -163,7 +198,6 @@ impl Searcher {
     
     /// Check if position has repeated (for draw detection)
     pub fn is_repetition(&self, hash: u64) -> bool {
-        // Count how many times this hash appears in history
         self.position_history.iter().filter(|&&h| h == hash).count() >= 1
     }
 
@@ -184,12 +218,13 @@ impl Searcher {
 
     /// Signal the search to stop
     pub fn stop(&mut self) {
-        self.stop = true;
+        self.shared.stop.store(true, Ordering::Relaxed);
     }
 
     /// Check if search should stop (hard time limit, nodes limit, etc.)
     pub fn should_stop(&self) -> bool {
-        if self.stop {
+        // Check global stop flag
+        if self.shared.stop.load(Ordering::Relaxed) {
             return true;
         }
         
@@ -205,7 +240,7 @@ impl Searcher {
     
     /// Check if we can start a new iteration (soft time limit)
     fn can_start_new_iteration(&self) -> bool {
-        if self.stop {
+        if self.shared.stop.load(Ordering::Relaxed) {
             return false;
         }
         
@@ -226,10 +261,33 @@ impl Searcher {
         
         true
     }
+    
+    /// Create a helper searcher that shares TT but has own tables
+    fn create_helper(&self) -> Self {
+        Self {
+            board: self.board.clone(),
+            shared: Arc::clone(&self.shared),
+            killers: KillerTable::new(),
+            history: HistoryTable::new(),
+            countermoves: CounterMoveTable::new(),
+            time_manager: self.time_manager.clone(),
+            stats: SearchStats::default(),
+            best_move: None,
+            pv: Vec::new(),
+            nnue: self.nnue.clone(),
+            position_history: self.position_history.clone(),
+            stable_move_count: 0,
+            last_best_move: None,
+            num_threads: 1,
+            is_helper: true,
+        }
+    }
 
-    /// Run the search with given limits
+    /// Run the search with given limits (with Lazy SMP multi-threading)
     pub fn search(&mut self, limits: SearchLimits) -> SearchResult {
-        self.stop = false;
+        // Reset state
+        self.shared.stop.store(false, Ordering::Relaxed);
+        self.shared.total_nodes.store(0, Ordering::Relaxed);
         self.stats = SearchStats::default();
         self.best_move = None;
         self.pv.clear();
@@ -237,7 +295,7 @@ impl Searcher {
         self.last_best_move = None;
         
         // Increment TT generation for new search
-        self.tt.new_search();
+        self.shared.tt.new_search();
         
         // Clear killer moves for new search
         self.killers.clear();
@@ -250,12 +308,45 @@ impl Searcher {
         
         let max_depth = limits.depth.unwrap_or(Depth::MAX);
         
-        // Iterative deepening with aspiration windows
+        // Spawn helper threads for Lazy SMP
+        let mut handles = Vec::new();
+        
+        if self.num_threads > 1 {
+            for _ in 1..self.num_threads {
+                let mut helper = self.create_helper();
+                let limits_clone = limits.clone();
+                let max_d = max_depth;
+                
+                let handle = thread::spawn(move || {
+                    helper.search_internal(limits_clone, max_d);
+                });
+                handles.push(handle);
+            }
+        }
+        
+        // Main thread search (prints UCI output)
+        let result = self.search_internal(limits, max_depth);
+        
+        // Signal all helpers to stop
+        self.shared.stop.store(true, Ordering::Relaxed);
+        
+        // Wait for all helper threads
+        for handle in handles {
+            let _ = handle.join();
+        }
+        
+        // Get total nodes from all threads
+        self.stats.nodes = self.shared.total_nodes.load(Ordering::Relaxed);
+        
+        result
+    }
+    
+    /// Internal search loop (called by main and helper threads)
+    fn search_internal(&mut self, _limits: SearchLimits, max_depth: Depth) -> SearchResult {
         let mut best_score = Score::neg_infinity();
         const INITIAL_WINDOW: i32 = 25;
         
         // Initialize evaluator at root
-        // Clone the Arc to decouple lifetime from &self, avoiding borrow checker conflict
         let local_nnue = self.nnue.clone();
         let mut root_evaluator = SearchEvaluator::new(local_nnue.as_ref(), &self.board);
         
@@ -266,7 +357,6 @@ impl Searcher {
             }
             
             // Early termination: stop when forced mate is found
-            // No point searching deeper - mate can only be shortened, not improved
             if best_score.is_mate() && self.best_move.is_some() {
                 break;
             }
@@ -322,17 +412,19 @@ impl Searcher {
                 // Widen window for next attempt
                 delta *= 2;
                 if delta > 500 {
-                    // Window too wide, use full window
                     alpha = Score::neg_infinity();
                     beta = Score::infinity();
                 }
             }
 
             self.stats.depth = Depth::new(depth);
-            self.stats.hashfull = self.tt.hashfull();
+            self.stats.hashfull = self.shared.tt.hashfull();
             
             // Update time from time manager
             self.stats.time_ms = self.time_manager.elapsed();
+            
+            // Report nodes to shared counter
+            self.shared.total_nodes.fetch_add(self.stats.nodes, Ordering::Relaxed);
             
             // Track move stability for early termination
             if self.best_move == self.last_best_move {
@@ -342,10 +434,10 @@ impl Searcher {
                 self.last_best_move = self.best_move;
             }
 
-            // Print info for this depth
-            if !self.should_stop() {
+            // Print info for this depth (main thread only)
+            if !self.is_helper && !self.should_stop() {
                 self.stats.print_profiling();
-                self.stats.time_search = (self.time_manager.elapsed() as u64) * 1_000_000; // convert ms to ns approximation
+                self.stats.time_search = (self.time_manager.elapsed() as u64) * 1_000_000;
                 let pv_str: String = self.pv.iter()
                     .map(|m| m.to_string())
                     .collect::<Vec<_>>()
@@ -356,7 +448,7 @@ impl Searcher {
                     depth,
                     self.stats.seldepth.raw(),
                     best_score,
-                    self.stats.nodes,
+                    self.shared.total_nodes.load(Ordering::Relaxed),
                     self.stats.qnodes,
                     self.stats.eval_calls,
                     self.stats.nps(),
@@ -414,6 +506,12 @@ impl Searcher {
     #[inline]
     pub fn inc_eval_calls(&mut self) {
         self.stats.eval_calls += 1;
+    }
+    
+    /// Access the shared TT for probing
+    #[inline]
+    pub fn tt(&self) -> &TranspositionTable {
+        &self.shared.tt
     }
 }
 

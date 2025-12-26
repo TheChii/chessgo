@@ -96,7 +96,7 @@ impl TimeManager {
             hard_limit: u64::MAX,
             move_overhead: 10,
             infinite: true,
-            start_time: None,
+            start_time: Some(Instant::now()),
         }
     }
 
@@ -155,8 +155,14 @@ impl TimeManager {
             };
         }
 
-        // Fallback to infinite
-        Self::new()
+        // Fallback to infinite (but with timer started)
+        Self {
+            soft_limit: u64::MAX,
+            hard_limit: u64::MAX,
+            move_overhead,
+            infinite: true,
+            start_time: Some(Instant::now()),
+        }
     }
     
     /// Start the timer (call at search start)
