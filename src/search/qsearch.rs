@@ -24,10 +24,10 @@ const PIECE_VALUES: [i32; 6] = [
 
 /// Delta margin: if stand_pat + best possible gain < alpha, prune
 /// Using Queen value as the maximum possible gain from a single capture
-const DELTA_MARGIN: i32 = 900;
+const DELTA_MARGIN: i32 = 600;
 
 /// Safety margin for individual move delta pruning
-const DELTA_SAFETY: i32 = 200;
+const DELTA_SAFETY: i32 = 100;
 
 /// Get the value of a piece for delta pruning
 #[inline]

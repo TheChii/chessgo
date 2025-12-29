@@ -7,7 +7,7 @@
 //!
 //! Future extensions: null move pruning, LMR, futility pruning
 
-use super::{Searcher, SearchStats, ordering, qsearch};
+use super::{Searcher, SearchStats, ordering, qsearch, see};
 use super::tt::BoundType;
 use crate::types::{Board, Move, Score, Depth, Ply, Piece, SCORE_MATE};
 use crate::eval::SearchEvaluator;
@@ -155,8 +155,32 @@ pub fn search(
 
     let in_check = board.in_check();
 
+    // === Reverse Futility Pruning (RFP) ===
+    // If we are way ahead, we can prune without searching
+    // Distinct from standard Futility Pruning which prunes *moves*
+    let mut static_eval = None;
+    if !in_check && depth.raw() <= 7 {
+        searcher.inc_eval_calls();
+        let t_eval = Instant::now();
+        let eval = evaluator.evaluate(board);
+        searcher.add_eval_time(t_eval.elapsed().as_nanos() as u64);
+        static_eval = Some(eval);
+
+        // RFP Margin: 75 * depth (tuneable)
+        let margin = Score::cp(75 * depth.raw() as i32);
+        
+        if eval - margin >= beta {
+             return SearchResult {
+                best_move: None,
+                score: eval - margin, // Soft cap to avoid crazy scores
+                pv: Vec::new(),
+                stats: searcher.stats().clone(),
+            };
+        }
+    }
+
     // === ProbCut ===
-    const PROBCUT_MARGIN: i32 = 200;
+    const PROBCUT_MARGIN: i32 = 100;
     if depth.raw() >= 5 && (beta.raw() - alpha.raw() == 1) && !in_check && beta.raw().abs() < (SCORE_MATE - 1000) {
         let probe_beta = beta + Score::cp(PROBCUT_MARGIN);
         let probe_depth = Depth::new(depth.raw() - 4);
@@ -193,8 +217,8 @@ pub fn search(
             | board.piece_bb(Piece::Queen)).is_empty();
         
         if !dominated_by_pawns {
-            // Reduction: R=3 if depth > 6, else R=2
-            let r = if depth.raw() > 6 { 3 } else { 2 };
+            // Reduction: R=5 if depth > 6, else R=4 (aggressive)
+            let r = if depth.raw() > 6 { 5 } else { 4 };
             
             // Create a null move board (pass the turn)
             let null_board = board.make_null_move();
@@ -288,21 +312,20 @@ pub fn search(
     ordering::order_moves_full(board, &mut move_vec, tt_move, killers, counter_move, &searcher.history, color);
     searcher.add_order_time(t_order.elapsed().as_nanos() as u64);
 
-    // Cache static eval for futility pruning (only compute once per node)
-    let static_eval = if depth.raw() <= 3 && !in_check {
+    // Static eval is already computed for RFP if depth <= 7
+    // If not (e.g. was in check check or deeper), compute it now if needed for Razoring/Futility
+    if static_eval.is_none() && depth.raw() <= 3 && !in_check {
         searcher.inc_eval_calls();
         let t_eval = Instant::now();
         let val = evaluator.evaluate(board);
         searcher.add_eval_time(t_eval.elapsed().as_nanos() as u64);
-        Some(val)
-    } else {
-        None
-    };
+        static_eval = Some(val);
+    }
     
     // Razoring
     if depth.raw() <= 3 && (beta.raw() - alpha.raw() == 1) && !in_check {
         if let Some(eval) = static_eval {
-            let threshold = alpha - Score::cp(300 + depth.raw() as i32 * 100);
+            let threshold = alpha - Score::cp(200 + depth.raw() as i32 * 60);
             if eval < threshold {
                 let result = qsearch::quiescence(searcher, evaluator, board, ply, alpha, beta);
                  if result.score < alpha {
@@ -339,7 +362,7 @@ pub fn search(
         // Check extension: extend +1 when in check to avoid horizon effect
         let extension = if in_check { 1 } else { 0 };
         
-        let search_depth = if move_idx >= 4 
+        let search_depth = if move_idx >= 2 
             && depth.raw() >= 3 
             && is_quiet 
             && !in_check 
@@ -349,7 +372,7 @@ pub fn search(
             // Logarithmic reduction formula
             let d = (depth.raw() as f32).ln();
             let m_idx = ((move_idx + 1) as f32).ln();
-            let reduction = ((d * m_idx) / 2.5) as i32;
+            let reduction = ((d * m_idx) / 1.9) as i32;
             let reduction = reduction.min(depth.raw() - 2).max(1);
             reduced = true;
             Depth::new((depth.raw() - 1 - reduction + extension).max(1))
@@ -357,11 +380,32 @@ pub fn search(
             Depth::new((depth.raw() - 1 + extension).max(0))
         };
 
+        // === History Pruning ===
+        // Prune quiet moves that have historically failed significantly
+        if depth.raw() < 4 && is_quiet && !in_check && !gives_check && !is_killer && move_idx > 0 {
+            // Threshold: -3000 * depth (e.g. -3000 at d1, -6000 at d2)
+            let threshold = -3000 * depth.raw() as i32;
+            if searcher.history.get(color, m) < threshold {
+                 // Track for history stats if needed, or just prune
+                continue;
+            }
+        }
+
+        // === SEE Pruning for Quiet Moves ===
+        // Prune quiet moves that are obvious blunders (e.g. putting a piece en prise)
+        if depth.raw() <= 4 && is_quiet && !in_check && !gives_check && move_idx > 0 {
+             // If move loses material (at least 50cp), prune it
+             // This uses SEE to see if the move is "safe"
+             if !see::see_ge(board, m, -50) {
+                 continue;
+             }
+        }
+
         // === Futility Pruning ===
         // At shallow depths, skip quiet moves if eval + margin is below alpha
         if let Some(se) = static_eval {
             if is_quiet && !gives_check && move_idx > 0 {
-                let margin = 100 * depth.raw();
+                let margin = 150 * depth.raw();
                 if se.raw() + margin < alpha.raw() {
                     // Track for history
                     if quiets_count < 64 {
