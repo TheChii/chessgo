@@ -53,15 +53,20 @@ pub fn score_move(
         score += piece_value(promo) + PROMOTION_BONUS;
     }
 
-    // Captures scored by SEE
+    // Captures: skip SEE for obviously good captures (victim >= attacker)
     if m.is_capture() {
-        let see_value = see::see(board, m);
-        if see_value >= 0 {
-            // Good capture: use MVV-LVA within the bonus
-            score += GOOD_CAPTURE_BONUS + mvv_lva_score(board, m);
+        let mvv_lva = mvv_lva_score(board, m);
+        if mvv_lva >= 0 {
+            // Winning or equal capture (e.g., PxQ, NxN) - skip expensive SEE
+            score += GOOD_CAPTURE_BONUS + mvv_lva;
         } else {
-            // Bad capture: penalize
-            score += BAD_CAPTURE_PENALTY + mvv_lva_score(board, m);
+            // Potentially losing capture - use SEE to verify
+            let see_value = see::see(board, m);
+            if see_value >= 0 {
+                score += GOOD_CAPTURE_BONUS + mvv_lva;
+            } else {
+                score += BAD_CAPTURE_PENALTY + mvv_lva;
+            }
         }
     } else {
         // Quiet move - check killers and counter-move
