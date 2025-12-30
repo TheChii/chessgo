@@ -4,9 +4,12 @@
 //! to ensure we don't stop in the middle of a tactical sequence.
 //!
 //! Implements delta pruning to skip hopeless captures.
+//!
+//! Uses compile-time node type specialization via the `NodeType` trait.
 
 use super::{Searcher, ordering};
 use super::negamax::SearchResult;
+use super::node_types::NodeType;
 use super::see::is_good_capture;
 use crate::types::{Board, Move, Score, Ply, Piece};
 use crate::eval::SearchEvaluator;
@@ -35,8 +38,10 @@ fn piece_value(piece: Piece) -> i32 {
     PIECE_VALUES[piece.index()]
 }
 
-/// Quiescence search - search captures only to avoid horizon effect
-pub fn quiescence(
+/// Quiescence search - search captures only to avoid horizon effect.
+///
+/// Uses compile-time node type specialization via the `NodeType` trait.
+pub fn quiescence<NT: NodeType>(
     searcher: &mut Searcher,
     evaluator: &mut SearchEvaluator,
     board: &Board,
@@ -135,7 +140,7 @@ pub fn quiescence(
         let mut child_evaluator = evaluator.clone();
         child_evaluator.update_move(board, m); // board is position BEFORE move
 
-        let result = quiescence(searcher, &mut child_evaluator, &new_board, ply.next(), -beta, -alpha);
+        let result = quiescence::<NT::Next>(searcher, &mut child_evaluator, &new_board, ply.next(), -beta, -alpha);
         let score = -result.score;
 
         if score > best_score {

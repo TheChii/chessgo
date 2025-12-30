@@ -4,10 +4,13 @@
 //! - Transposition table probing and storing
 //! - Alpha-beta pruning
 //! - Quiescence search for captures
+//! - Compile-time node type specialization (no runtime PV checks)
 //!
-//! Future extensions: null move pruning, LMR, futility pruning
+//! Uses Rust generics for compile-time node type specialization.
+//! See `node_types` module for `NodeType` trait and concrete types.
 
 use super::{Searcher, SearchStats, ordering, qsearch, see};
+use super::node_types::{NodeType, OffPV};
 use super::tt::BoundType;
 use crate::types::{Board, Move, Score, Depth, Ply, Piece, SCORE_MATE};
 use crate::eval::SearchEvaluator;
@@ -22,8 +25,13 @@ pub struct SearchResult {
     pub stats: SearchStats,
 }
 
-/// Main negamax search function with TT integration and null move pruning
-pub fn search(
+/// Main negamax search function with TT integration and null move pruning.
+///
+/// Uses compile-time node type specialization via the `NodeType` trait.
+/// - `NT::PV`: true if this is a principal variation node
+/// - `NT::ROOT`: true if this is the root node
+/// - `NT::Next`: the node type for child PV searches
+pub fn search<NT: NodeType>(
     searcher: &mut Searcher,
     evaluator: &mut SearchEvaluator,
     board: &Board,
@@ -31,7 +39,6 @@ pub fn search(
     ply: Ply,
     mut alpha: Score,
     mut beta: Score,
-    allow_null: bool,
     prev_move: Option<Move>,
 ) -> SearchResult {
     searcher.inc_nodes();
@@ -42,7 +49,8 @@ pub fn search(
     // === Repetition Detection with Contempt ===
     // Check for draw by repetition (position seen before in game history)
     // Use contempt: avoid draws when winning, seek draws when losing
-    if ply.raw() > 0 && searcher.is_repetition(hash) {
+    // Skip at root node (ply == 0)
+    if !NT::ROOT && searcher.is_repetition(hash) {
         // Contempt factor: small penalty/bonus for draws based on expected score
         // If alpha > 0 (we expect to be winning), penalize draws to avoid them
         // If beta < 0 (we expect to be losing), reward draws to seek them
@@ -180,12 +188,13 @@ pub fn search(
     }
 
     // === ProbCut ===
+    // Only on non-PV nodes (zero-window)
     const PROBCUT_MARGIN: i32 = 100;
-    if depth.raw() >= 5 && (beta.raw() - alpha.raw() == 1) && !in_check && beta.raw().abs() < (SCORE_MATE - 1000) {
+    if !NT::PV && depth.raw() >= 5 && !in_check && beta.raw().abs() < (SCORE_MATE - 1000) {
         let probe_beta = beta + Score::cp(PROBCUT_MARGIN);
         let probe_depth = Depth::new(depth.raw() - 4);
 
-        let result = search(
+        let result = search::<OffPV>(
             searcher,
             evaluator,
             board,
@@ -193,7 +202,6 @@ pub fn search(
             ply,
             probe_beta - Score::cp(1),
             probe_beta,
-            false,
             None
         );
 
@@ -208,8 +216,9 @@ pub fn search(
     }
 
     // === Null Move Pruning ===
-    // Skip if: in check, depth too low, null move disabled, or only king+pawns
-    if allow_null && !in_check && depth.raw() >= 3 {
+    // Skip if: in check, depth too low, PV node, or only king+pawns
+    // Note: we don't do NMP on PV nodes or at root
+    if !NT::PV && !in_check && depth.raw() >= 3 {
         // Don't do null move in pure pawn endgames (zugzwang risk)
         let dominated_by_pawns = (board.piece_bb(Piece::Knight)
             | board.piece_bb(Piece::Bishop)
@@ -226,7 +235,7 @@ pub fn search(
             // Clone evaluator for null move (no piece updates needed)
             let mut null_evaluator = evaluator.clone();
             
-            let null_result = search(
+            let null_result = search::<OffPV>(
                 searcher,
                 &mut null_evaluator,
                 &null_board,
@@ -234,7 +243,6 @@ pub fn search(
                 ply.next(),
                 -beta,
                 -beta + Score::cp(1),
-                false,
                 None,  // No prev move for null move
             );
             
@@ -254,10 +262,10 @@ pub fn search(
 
     // === Internal Iterative Deepening (IID) ===
     // If we are at a PV node and have no TT move, search shallower to find one
-    if tt_move.is_none() && depth.raw() >= 6 && (beta.raw() - alpha.raw() > 1) {
+    if NT::PV && tt_move.is_none() && depth.raw() >= 6 {
         let iid_depth = Depth::new(depth.raw() - 2);
         
-        let result = search(
+        let result = search::<NT>(
             searcher,
             evaluator,
             board,
@@ -265,7 +273,6 @@ pub fn search(
             ply,
             alpha,
             beta,
-            allow_null,
             prev_move,
         );
         
@@ -294,7 +301,7 @@ pub fn search(
 
     // Quiescence search at depth 0
     if depth.is_qs() {
-        return qsearch::quiescence(searcher, evaluator, board, ply, alpha, beta);
+        return qsearch::quiescence::<NT>(searcher, evaluator, board, ply, alpha, beta);
     }
 
     // Get killers for this ply
@@ -322,12 +329,12 @@ pub fn search(
         static_eval = Some(val);
     }
     
-    // Razoring
-    if depth.raw() <= 3 && (beta.raw() - alpha.raw() == 1) && !in_check {
+    // Razoring - only on non-PV nodes
+    if !NT::PV && depth.raw() <= 3 && !in_check {
         if let Some(eval) = static_eval {
             let threshold = alpha - Score::cp(200 + depth.raw() as i32 * 60);
             if eval < threshold {
-                let result = qsearch::quiescence(searcher, evaluator, board, ply, alpha, beta);
+                let result = qsearch::quiescence::<OffPV>(searcher, evaluator, board, ply, alpha, beta);
                  if result.score < alpha {
                     return result; 
                 }
@@ -428,8 +435,8 @@ pub fn search(
                 child_eval.refresh(&new_board);
             }
 
-            // First move: search with full window
-            result = search(
+            // First move: search with full window (PV search)
+            result = search::<NT::Next>(
                 searcher,
                 &mut child_eval,
                 &new_board,
@@ -437,7 +444,6 @@ pub fn search(
                 ply.next(),
                 -beta,
                 -alpha,
-                true,
                 Some(m),  // Pass current move as prev_move
             );
             score = -result.score;
@@ -448,8 +454,8 @@ pub fn search(
                 child_eval.refresh(&new_board);
             }
 
-            // Later moves: null window search first
-            result = search(
+            // Later moves: null window search first (OffPV)
+            result = search::<OffPV>(
                 searcher,
                 &mut child_eval,
                 &new_board,
@@ -457,15 +463,14 @@ pub fn search(
                 ply.next(),
                 -alpha - Score::cp(1),
                 -alpha,
-                true,
                 Some(m),
             );
             score = -result.score;
             
-            // Re-search with full window if fails high
-            if score > alpha && score < beta && !searcher.should_stop() {
+            // Re-search with full window if fails high (only on PV nodes)
+            if NT::PV && score > alpha && score < beta && !searcher.should_stop() {
                 // Re-use same child_eval since board/move didn't change
-                result = search(
+                result = search::<NT::Next>(
                     searcher,
                     &mut child_eval,
                     &new_board,
@@ -473,7 +478,6 @@ pub fn search(
                     ply.next(),
                     -beta,
                     -alpha,
-                    true,
                     Some(m),
                 );
                 score = -result.score;
@@ -487,7 +491,7 @@ pub fn search(
                 child_eval.refresh(&new_board);
             }
 
-            result = search(
+            result = search::<NT::Next>(
                 searcher,
                 &mut child_eval,
                 &new_board,
@@ -495,7 +499,6 @@ pub fn search(
                 ply.next(),
                 -beta,
                 -alpha,
-                true,
                 Some(m),
             );
             score = -result.score;

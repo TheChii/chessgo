@@ -21,6 +21,9 @@ mod killers;
 mod history;
 mod see;
 mod countermove;
+pub mod node_types;
+
+pub use node_types::{NodeType, Root, OnPV, OffPV};
 
 pub use limits::{SearchLimits, TimeManager};
 pub use negamax::SearchResult;
@@ -380,7 +383,7 @@ impl Searcher {
 
             // Aspiration loop: widen window on fail-high/low
             loop {
-                let result = negamax::search(
+                let result = negamax::search::<Root>(
                     self,
                     &mut root_evaluator,
                     &self.board.clone(),
@@ -388,7 +391,6 @@ impl Searcher {
                     Ply::ZERO,
                     alpha,
                     beta,
-                    true,
                     None,  // No prev move at root
                 );
 

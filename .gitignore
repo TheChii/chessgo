@@ -2,3 +2,6 @@
 
 # Opening books (too large for GitHub)
 *.log
+
+# Reference code (not part of this project)
+viridithas_reference/
